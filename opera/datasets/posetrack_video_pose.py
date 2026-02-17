@@ -886,23 +886,16 @@ class PosetrackVideoPoseDataset(CustomDataset):
         metrics[nJoints + 1, 0] = metricsAll['motp'][0, nJoints]
         metrics[nJoints + 2, 0] = metricsAll['pre'][0, nJoints]
         metrics[nJoints + 3, 0] = metricsAll['rec'][0, nJoints]
-        track_cum = printTable(metrics, motHeader=True)
+
+        # Store unfiltered metrics for comparison
+        joint_mota_unfiltered = metricsAll['mota'][0, nJoints]
+        motp_unfiltered = metricsAll['motp'][0, nJoints]
+        pre_unfiltered = metricsAll['pre'][0, nJoints]
+        rec_unfiltered = metricsAll['rec'][0, nJoints]
 
         # --- Compute person-level MOTA for better interpretability ---
-        print_log("\n" + "="*80)
-        print_log("PERSON-LEVEL TRACKING METRICS (Poses, not Joints)")
-        print_log("="*80)
         person_metrics = self.compute_person_level_mota(
             gtFramesAll_trk, prFramesAll_trk, distThresh=0.5)
-        print_log(f"Total GT Persons:       {person_metrics['gt_persons']}")
-        print_log(f"Correctly Detected:     {person_metrics['matched']}")
-        print_log(f"Misses (False Negatives): {person_metrics['misses']}")
-        print_log(f"False Positives:        {person_metrics['fp']}")
-        print_log(f"ID Switches:            {person_metrics['id_switches']}")
-        print_log(f"\nPerson-level MOTA:      {person_metrics['mota']:.2f}%")
-        print_log(f"Precision:              {person_metrics['precision']:.2f}%")
-        print_log(f"Recall:                 {person_metrics['recall']:.2f}%")
-        print_log("="*80 + "\n")
 
         # Log person-level MOTA to wandb
         try:
@@ -946,39 +939,76 @@ class PosetrackVideoPoseDataset(CustomDataset):
             metricsAll_jf = evaluateTracking(
                 gtFramesAll_jf, prFramesAll_jf, False)
 
-            metrics_jf = np.full((nJoints + 4, 1), np.nan)
-            for i in range(nJoints + 1):
-                metrics_jf[i, 0] = metricsAll_jf['mota'][0, i]
-            metrics_jf[nJoints + 1, 0] = metricsAll_jf['motp'][0, nJoints]
-            metrics_jf[nJoints + 2, 0] = metricsAll_jf['pre'][0, nJoints]
-            metrics_jf[nJoints + 3, 0] = metricsAll_jf['rec'][0, nJoints]
-            print_log(f'\n=> Joint-filtered MOTA (joint_score_thr='
-                      f'{joint_score_thr}):')
-            printTable(metrics_jf, motHeader=True)
+            # Store filtered metrics for comparison
+            joint_mota_filtered = metricsAll_jf['mota'][0, nJoints]
+            motp_filtered = metricsAll_jf['motp'][0, nJoints]
+            pre_filtered = metricsAll_jf['pre'][0, nJoints]
+            rec_filtered = metricsAll_jf['rec'][0, nJoints]
 
-            print_log("\n" + "="*80)
-            print_log("PERSON-LEVEL TRACKING (with joint filtering)")
-            print_log("="*80)
             person_metrics_jf = self.compute_person_level_mota(
                 gtFramesAll_jf, prFramesAll_jf, distThresh=0.5)
-            print_log(f"Total GT Persons:       "
-                      f"{person_metrics_jf['gt_persons']}")
-            print_log(f"Correctly Detected:     "
-                      f"{person_metrics_jf['matched']}")
-            print_log(f"Misses (False Negatives): "
-                      f"{person_metrics_jf['misses']}")
-            print_log(f"False Positives:        {person_metrics_jf['fp']}")
-            print_log(f"ID Switches:            "
-                      f"{person_metrics_jf['id_switches']}")
-            print_log(f"\nPerson-level MOTA:      "
-                      f"{person_metrics_jf['mota']:.2f}%")
-            print_log(f"Precision:              "
-                      f"{person_metrics_jf['precision']:.2f}%")
-            print_log(f"Recall:                 "
-                      f"{person_metrics_jf['recall']:.2f}%")
-            print_log("="*80 + "\n")
+        else:
+            # No joint filtering
+            joint_mota_filtered = None
+            motp_filtered = None
+            pre_filtered = None
+            rec_filtered = None
+            person_metrics_jf = None
 
-        # Use AP results (from unfiltered evaluation)
+        # --- Print consolidated results ---
+        filt_col = f"{'Joint-Filtered':<20}" if joint_mota_filtered is not None else ""
+        filt_val = lambda v: f"{v:<20.2f}" if v is not None else ""
+
+        lines = []
+        lines.append("\n" + "="*60)
+        lines.append("JOINT-LEVEL MEAN MOTA")
+        lines.append("="*60)
+        lines.append(f"{'Metric':<20} {'Unfiltered':<20} {filt_col}")
+        lines.append("-"*60)
+        lines.append(f"{'MOTA (%)':<20} {joint_mota_unfiltered:<20.2f} {filt_val(joint_mota_filtered)}")
+        lines.append(f"{'MOTP (%)':<20} {motp_unfiltered:<20.2f} {filt_val(motp_filtered)}")
+        lines.append(f"{'Precision (%)':<20} {pre_unfiltered:<20.2f} {filt_val(pre_filtered)}")
+        lines.append(f"{'Recall (%)':<20} {rec_unfiltered:<20.2f} {filt_val(rec_filtered)}")
+        lines.append("="*60)
+
+        # Person-level MOTA comparison table
+        pf_col = f"{'Joint-Filtered':<20}" if person_metrics_jf else ""
+        pf_val = lambda k: f"{person_metrics_jf[k]:<20}" if person_metrics_jf else ""
+        pf_fval = lambda k: f"{person_metrics_jf[k]:<20.2f}" if person_metrics_jf else ""
+
+        lines.append("")
+        lines.append("="*60)
+        lines.append("PERSON-LEVEL MOTA")
+        lines.append("="*60)
+        lines.append(f"{'Metric':<20} {'Unfiltered':<20} {pf_col}")
+        lines.append("-"*60)
+        lines.append(f"{'GT Persons':<20} {person_metrics['gt_persons']:<20} {pf_val('gt_persons')}")
+        lines.append(f"{'Matched':<20} {person_metrics['matched']:<20} {pf_val('matched')}")
+        lines.append(f"{'Misses':<20} {person_metrics['misses']:<20} {pf_val('misses')}")
+        lines.append(f"{'False Positives':<20} {person_metrics['fp']:<20} {pf_val('fp')}")
+        lines.append(f"{'ID Switches':<20} {person_metrics['id_switches']:<20} {pf_val('id_switches')}")
+        lines.append(f"{'MOTA (%)':<20} {person_metrics['mota']:<20.2f} {pf_fval('mota')}")
+        lines.append(f"{'Precision (%)':<20} {person_metrics['precision']:<20.2f} {pf_fval('precision')}")
+        lines.append(f"{'Recall (%)':<20} {person_metrics['recall']:<20.2f} {pf_fval('recall')}")
+        lines.append("="*60)
+
+        # AP results table
+        joint_ap_names = ['Head', 'Shoulder', 'Elbow', 'Wrist',
+                          'Hip', 'Knee', 'Ankle']
+        lines.append("")
+        lines.append("="*40)
+        lines.append("AVERAGE PRECISION (mAP)")
+        lines.append("="*40)
+        lines.append(f"{'Joint':<20} {'AP (%)':<20}")
+        lines.append("-"*40)
+        for i, name in enumerate(joint_ap_names):
+            lines.append(f"{name:<20} {ap_cum[i]:<20.2f}")
+        lines.append("-"*40)
+        lines.append(f"{'Mean':<20} {ap_cum[7]:<20.2f}")
+        lines.append("="*40 + "\n")
+
+        print_log("\n".join(lines))
+
         name_value = [
             ('Head', ap_cum[0]),
             ('Shoulder', ap_cum[1]),
@@ -1043,6 +1073,151 @@ class PosetrackVideoPoseDataset(CustomDataset):
                     # new_data.append(data[frame_id - count])  # posetrack18
             out_data[key] = new_data
         return out_data
+
+    def evaluate_from_json(self, save_dir, logger=None):
+        """Recompute metrics from previously saved JSON result directories.
+
+        Expects the following subdirectories under save_dir:
+          - val_set_json_results_ap/          (unfiltered, for AP)
+          - val_set_json_results/             (person-filtered, for MOTA)
+          - val_set_json_results_joint_filtered/  (joint-filtered, optional)
+
+        Args:
+            save_dir (str): Directory containing the saved JSON results.
+            logger: Optional logger.
+
+        Returns:
+            OrderedDict: AP name-value pairs.
+        """
+        from ..core.posetrack_utils.poseval.py.evaluateAP import evaluateAP
+        from ..core.posetrack_utils.poseval.py.evaluateTracking import \
+            evaluateTracking
+        from ..core.posetrack_utils.poseval.py.eval_helpers import (
+            Joint, printTable, load_data_dir)
+
+        annot_dir = 'DcPose_supp_files/posetrack17_annotation_dirs/jsons/val/'
+        nJoints = Joint().count
+
+        ap_output_dir = os.path.join(save_dir, 'val_set_json_results_ap')
+        track_output_dir = os.path.join(save_dir, 'val_set_json_results')
+        jfilt_output_dir = os.path.join(
+            save_dir, 'val_set_json_results_joint_filtered')
+
+        # --- AP evaluation ---
+        if os.path.isdir(ap_output_dir):
+            print_log(f"=> Running AP evaluation from {ap_output_dir}")
+            gtFramesAll_ap, prFramesAll_ap = load_data_dir(
+                ['', annot_dir, ap_output_dir])
+            apAll, _, _ = evaluateAP(gtFramesAll_ap, prFramesAll_ap)
+            ap_cum = printTable(apAll)
+        else:
+            print_log(f"WARNING: AP dir not found: {ap_output_dir}")
+            ap_cum = [0.0] * 8
+
+        # --- Unfiltered MOTA ---
+        if os.path.isdir(track_output_dir):
+            print_log(f"=> Running MOTA evaluation from {track_output_dir}")
+            gtFramesAll_trk, prFramesAll_trk = load_data_dir(
+                ['', annot_dir, track_output_dir])
+            metricsAll = evaluateTracking(
+                gtFramesAll_trk, prFramesAll_trk, False)
+            joint_mota_unfiltered = metricsAll['mota'][0, nJoints]
+            motp_unfiltered = metricsAll['motp'][0, nJoints]
+            pre_unfiltered = metricsAll['pre'][0, nJoints]
+            rec_unfiltered = metricsAll['rec'][0, nJoints]
+            person_metrics = self.compute_person_level_mota(
+                gtFramesAll_trk, prFramesAll_trk, distThresh=0.5)
+        else:
+            print_log(f"WARNING: Track dir not found: {track_output_dir}")
+            joint_mota_unfiltered = 0.0
+            motp_unfiltered = 0.0
+            pre_unfiltered = 0.0
+            rec_unfiltered = 0.0
+            person_metrics = {
+                'gt_persons': 0, 'matched': 0, 'misses': 0,
+                'fp': 0, 'id_switches': 0,
+                'mota': 0.0, 'precision': 0.0, 'recall': 0.0}
+
+        # --- Joint-filtered MOTA ---
+        if os.path.isdir(jfilt_output_dir):
+            print_log(f"=> Running joint-filtered MOTA from {jfilt_output_dir}")
+            gtFramesAll_jf, prFramesAll_jf = load_data_dir(
+                ['', annot_dir, jfilt_output_dir])
+            metricsAll_jf = evaluateTracking(
+                gtFramesAll_jf, prFramesAll_jf, False)
+            joint_mota_filtered = metricsAll_jf['mota'][0, nJoints]
+            motp_filtered = metricsAll_jf['motp'][0, nJoints]
+            pre_filtered = metricsAll_jf['pre'][0, nJoints]
+            rec_filtered = metricsAll_jf['rec'][0, nJoints]
+            person_metrics_jf = self.compute_person_level_mota(
+                gtFramesAll_jf, prFramesAll_jf, distThresh=0.5)
+        else:
+            print_log(f"NOTE: Joint-filtered dir not found: {jfilt_output_dir}")
+            joint_mota_filtered = None
+            motp_filtered = None
+            pre_filtered = None
+            rec_filtered = None
+            person_metrics_jf = None
+
+        # --- Print consolidated results ---
+        filt_col = f"{'Joint-Filtered':<20}" if joint_mota_filtered is not None else ""
+        filt_val = lambda v: f"{v:<20.2f}" if v is not None else ""
+
+        lines = []
+        lines.append("\n" + "="*60)
+        lines.append("JOINT-LEVEL MEAN MOTA")
+        lines.append("="*60)
+        lines.append(f"{'Metric':<20} {'Unfiltered':<20} {filt_col}")
+        lines.append("-"*60)
+        lines.append(f"{'MOTA (%)':<20} {joint_mota_unfiltered:<20.2f} {filt_val(joint_mota_filtered)}")
+        lines.append(f"{'MOTP (%)':<20} {motp_unfiltered:<20.2f} {filt_val(motp_filtered)}")
+        lines.append(f"{'Precision (%)':<20} {pre_unfiltered:<20.2f} {filt_val(pre_filtered)}")
+        lines.append(f"{'Recall (%)':<20} {rec_unfiltered:<20.2f} {filt_val(rec_filtered)}")
+        lines.append("="*60)
+
+        pf_col = f"{'Joint-Filtered':<20}" if person_metrics_jf else ""
+        pf_val = lambda k: f"{person_metrics_jf[k]:<20}" if person_metrics_jf else ""
+        pf_fval = lambda k: f"{person_metrics_jf[k]:<20.2f}" if person_metrics_jf else ""
+
+        lines.append("")
+        lines.append("="*60)
+        lines.append("PERSON-LEVEL MOTA")
+        lines.append("="*60)
+        lines.append(f"{'Metric':<20} {'Unfiltered':<20} {pf_col}")
+        lines.append("-"*60)
+        lines.append(f"{'GT Persons':<20} {person_metrics['gt_persons']:<20} {pf_val('gt_persons')}")
+        lines.append(f"{'Matched':<20} {person_metrics['matched']:<20} {pf_val('matched')}")
+        lines.append(f"{'Misses':<20} {person_metrics['misses']:<20} {pf_val('misses')}")
+        lines.append(f"{'False Positives':<20} {person_metrics['fp']:<20} {pf_val('fp')}")
+        lines.append(f"{'ID Switches':<20} {person_metrics['id_switches']:<20} {pf_val('id_switches')}")
+        lines.append(f"{'MOTA (%)':<20} {person_metrics['mota']:<20.2f} {pf_fval('mota')}")
+        lines.append(f"{'Precision (%)':<20} {person_metrics['precision']:<20.2f} {pf_fval('precision')}")
+        lines.append(f"{'Recall (%)':<20} {person_metrics['recall']:<20.2f} {pf_fval('recall')}")
+        lines.append("="*60)
+
+        joint_ap_names = ['Head', 'Shoulder', 'Elbow', 'Wrist',
+                          'Hip', 'Knee', 'Ankle']
+        lines.append("")
+        lines.append("="*40)
+        lines.append("AVERAGE PRECISION (mAP)")
+        lines.append("="*40)
+        lines.append(f"{'Joint':<20} {'AP (%)':<20}")
+        lines.append("-"*40)
+        for i, name in enumerate(joint_ap_names):
+            lines.append(f"{name:<20} {ap_cum[i]:<20.2f}")
+        lines.append("-"*40)
+        lines.append(f"{'Mean':<20} {ap_cum[7]:<20.2f}")
+        lines.append("="*40 + "\n")
+
+        print_log("\n".join(lines))
+
+        name_value = OrderedDict([
+            ('Head', ap_cum[0]), ('Shoulder', ap_cum[1]),
+            ('Elbow', ap_cum[2]), ('Wrist', ap_cum[3]),
+            ('Hip', ap_cum[4]), ('Knee', ap_cum[5]),
+            ('Ankle', ap_cum[6]), ('Mean', ap_cum[7])
+        ])
+        return name_value, name_value['Mean']
 
     def compute_person_level_mota(self, gtFramesAll, prFramesAll, distThresh=0.5):
         """Compute MOTA metrics at the person/pose level (not joint level).
@@ -1290,6 +1465,10 @@ class PosetrackSequentialDataset(PosetrackVideoPoseDataset):
     labeled frames in the same video, enabling track query propagation
     during training.
 
+    The parent class handles data loading and filtering. After that completes,
+    this class groups the final filtered frames by video and builds sliding
+    window sequences.
+
     Args:
         seq_length (int): Number of consecutive windows per sample. Default: 2.
         *args, **kwargs: Same as PosetrackVideoPoseDataset.
@@ -1297,64 +1476,62 @@ class PosetrackSequentialDataset(PosetrackVideoPoseDataset):
 
     def __init__(self, *args, seq_length=2, **kwargs):
         self.seq_length = seq_length
+        self._seq_indices = None  # Built after parent init completes
         super().__init__(*args, **kwargs)
+        # At this point self.data_infos is fully loaded and filtered.
+        # Build sequential windows from the final data_infos.
+        self._build_sequences()
+        # Rebuild group flag now that __len__ returns sequence count
+        self._set_group_flag()
 
-    def _get_data(self):
-        """Group labeled frames by video, create sequences of T frames."""
-        # First, get all labeled frames as in parent
-        all_infos = []
-        for img_index in self.img_ids:
-            info = self.coco.load_imgs([img_index])[0]
-            if info['is_labeled']:
-                imgs = self._get_auxiliary_frames(img_index=img_index)
-                info['filename_prev'] = imgs[0]
-                info['filename_now'] = imgs[1]
-                info['filename_next'] = imgs[2]
-                all_infos.append(info)
-
-        # Group by video (directory name)
+    def _build_sequences(self):
+        """Build sequential windows from the final (filtered) data_infos."""
         from collections import defaultdict
+        # Group data_infos indices by video
         video_frames = defaultdict(list)
-        for info in all_infos:
+        for i, info in enumerate(self.data_infos):
             video_name = os.path.dirname(info['file_name'])
-            video_frames[video_name].append(info)
+            video_frames[video_name].append(i)
 
         # Sort frames within each video by frame number
         for vname in video_frames:
             video_frames[vname].sort(
-                key=lambda x: int(os.path.splitext(
-                    os.path.basename(x['file_name']))[0]))
+                key=lambda idx: int(os.path.splitext(
+                    os.path.basename(self.data_infos[idx]['file_name']))[0]))
 
-        # Create sequences of T consecutive frames
-        data_infos = []
-        self._seq_indices = []  # maps dataset index -> list of frame indices
-        frame_list = []  # flat list of all frames (for annotation loading)
-
-        for vname, frames in video_frames.items():
-            n = len(frames)
+        # Create sliding window sequences
+        self._seq_indices = []
+        for vname, frame_indices in video_frames.items():
+            n = len(frame_indices)
             if n < self.seq_length:
-                # Video too short — use all frames as one (padded) sequence
-                seq = list(range(len(frame_list),
-                                 len(frame_list) + n))
-                # Repeat last frame to reach seq_length
+                # Video too short — pad by repeating last frame
+                seq = list(frame_indices)
                 while len(seq) < self.seq_length:
                     seq.append(seq[-1])
                 self._seq_indices.append(seq)
-                frame_list.extend(frames)
             else:
-                # Sliding window of seq_length over the video's labeled frames
-                start_idx = len(frame_list)
-                frame_list.extend(frames)
                 for i in range(n - self.seq_length + 1):
-                    seq = list(range(start_idx + i,
-                                     start_idx + i + self.seq_length))
-                    self._seq_indices.append(seq)
+                    self._seq_indices.append(
+                        frame_indices[i:i + self.seq_length])
 
-        # data_infos is the flat list (used by parent for annotation loading)
-        data_infos = frame_list
-        return data_infos
+    def _set_group_flag(self):
+        """Set flag according to image aspect ratio."""
+        if self._seq_indices is None:
+            # During super().__init__(), before sequences are built —
+            # use parent behavior (iterates over data_infos directly)
+            super()._set_group_flag()
+            return
+        self.flag = np.zeros(len(self), dtype=np.uint8)
+        for i in range(len(self)):
+            frame_idx = self._seq_indices[i][0]
+            img_info = self.data_infos[frame_idx]
+            if img_info['width'] / img_info['height'] > 1:
+                self.flag[i] = 1
 
     def __len__(self):
+        if self._seq_indices is None:
+            # During super().__init__(), before sequences are built
+            return len(self.data_infos)
         return len(self._seq_indices)
 
     def __getitem__(self, idx):

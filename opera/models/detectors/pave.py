@@ -108,6 +108,10 @@ class PAVE(DETR):
         """
         total_losses = {}
         track_state = None
+        # Track diagnostic keys — use last window's values (not averaged),
+        # since only windows after the first have meaningful track queries.
+        _track_diag_keys = {'trk_kpt_l1', 'det_kpt_l1', 'n_trk', 'n_trk_pos',
+                            'n_det_pos', 'trk_id_con'}
 
         T = len(imgs)
         for t in range(T):
@@ -120,7 +124,10 @@ class PAVE(DETR):
 
             # Accumulate losses (averaged over T)
             for k, v in losses.items():
-                if isinstance(v, torch.Tensor):
+                if k in _track_diag_keys:
+                    # Override with latest window's value (not averaged)
+                    total_losses[k] = v
+                elif isinstance(v, torch.Tensor):
                     total_losses[k] = total_losses.get(k, 0) + v / T
                 elif isinstance(v, list):
                     if k not in total_losses:
@@ -214,7 +221,7 @@ class PAVE(DETR):
             all_query_track_ids=all_query_track_ids)
 
         end = time.time()
-        print(f'Inference time: {end - start}')
+        # print(f'Inference time: {end - start}')
 
         bbox_kpt_results = []
         for item in results_list:

@@ -106,7 +106,7 @@ class PETR(DETR):
             feat, img_metas, rescale=rescale)
 
         end = time.time()
-        print(f'Inference time: {end - start}')
+        # print(f'Inference time: {end - start}')
 
         bbox_kpt_results = [
             bbox_kpt2result(det_bboxes, det_labels, det_kpts,

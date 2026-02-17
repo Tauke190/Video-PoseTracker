@@ -187,7 +187,7 @@ def computeMetrics(gtFramesAll, motAll, outputDir, bSaveAll, bSaveSeq):
 
     for si in range(nSeq):
     #for si in range(5):
-        print("seqidx: %d/%d" % (si+1,nSeq))
+        # print("seqidx: %d/%d" % (si+1,nSeq))
 
         # init per-joint metrics accumulator
         accAll = {}
@@ -323,46 +323,47 @@ def computeMetrics(gtFramesAll, motAll, outputDir, bSaveAll, bSaveSeq):
     metricsFinAll['rec'][0,nJoints]  = metricsFinAll['rec'] [0,idxs].mean()
 
     # Print intermediate metrics for debugging/analysis
-    print("\n" + "="*130)
-    print("JOINT-LEVEL METRICS (Spatial Joint-Level ID Switches Only)")
-    print("="*130)
-    print("\nPer-Joint Breakdown:")
-    print(f"{'Joint':<12} {'GT Objs':<10} {'Misses':<10} {'Detections':<12} {'False Pos':<12} {'ID Sw':<10} {'MOTA':<10}")
-    print("-"*130)
-    for i in range(nJoints):
-        joint_name = names.get(str(i), f'Joint {i}')
-        if metricsMidAll['num_objects'][0,i] > 0:
-            numObj = metricsMidAll['num_objects'][0,i]
-            numFP = metricsMidAll['num_false_positives'][0,i]
-            numSw = metricsMidAll['num_switches'][0,i]
-            mota_joint = 1. - (metricsMidAll['num_misses'][0,i] + numSw + numFP) / numObj
-        else:
-            numSw = 0
-            mota_joint = np.nan
-
-        print(f"{joint_name:<12} {metricsMidAll['num_objects'][0,i]:<10.0f} "
-              f"{metricsMidAll['num_misses'][0,i]:<10.0f} "
-              f"{metricsMidAll['num_detections'][0,i]:<12.0f} "
-              f"{metricsMidAll['num_false_positives'][0,i]:<12.0f} "
-              f"{metricsMidAll['num_switches'][0,i]:<10.0f} "
-              f"{mota_joint*100:<10.1f}")
-
-    print("-"*130)
-    total_gt = metricsMidAll['num_objects'][0,:].sum()
-    total_misses = metricsMidAll['num_misses'][0,:].sum()
-    total_detections = metricsMidAll['num_detections'][0,:].sum()
-    total_fp = metricsMidAll['num_false_positives'][0,:].sum()
-    total_sw = metricsMidAll['num_switches'][0,:].sum()
-
-    print(f"{'TOTAL':<12} {total_gt:<10.0f} "
-          f"{total_misses:<10.0f} "
-          f"{total_detections:<12.0f} "
-          f"{total_fp:<12.0f} "
-          f"{total_sw:<10.0f}")
-
-    print("\n  MOTA = 1 - (Misses + ID_Switches + FP) / GT")
-    print("  ID switches are spatial joint-level only (person-level switches removed).")
-    print("="*130 + "\n")
+    # (Per-joint breakdown commented out - will use consolidated table in evaluation script)
+    # print("\n" + "="*130)
+    # print("JOINT-LEVEL METRICS (Spatial Joint-Level ID Switches Only)")
+    # print("="*130)
+    # print("\nPer-Joint Breakdown:")
+    # print(f"{'Joint':<12} {'GT Objs':<10} {'Misses':<10} {'Detections':<12} {'False Pos':<12} {'ID Sw':<10} {'MOTA':<10}")
+    # print("-"*130)
+    # for i in range(nJoints):
+    #     joint_name = names.get(str(i), f'Joint {i}')
+    #     if metricsMidAll['num_objects'][0,i] > 0:
+    #         numObj = metricsMidAll['num_objects'][0,i]
+    #         numFP = metricsMidAll['num_false_positives'][0,i]
+    #         numSw = metricsMidAll['num_switches'][0,i]
+    #         mota_joint = 1. - (metricsMidAll['num_misses'][0,i] + numSw + numFP) / numObj
+    #     else:
+    #         numSw = 0
+    #         mota_joint = np.nan
+    #
+    #     print(f"{joint_name:<12} {metricsMidAll['num_objects'][0,i]:<10.0f} "
+    #           f"{metricsMidAll['num_misses'][0,i]:<10.0f} "
+    #           f"{metricsMidAll['num_detections'][0,i]:<12.0f} "
+    #           f"{metricsMidAll['num_false_positives'][0,i]:<12.0f} "
+    #           f"{metricsMidAll['num_switches'][0,i]:<10.0f} "
+    #           f"{mota_joint*100:<10.1f}")
+    #
+    # print("-"*130)
+    # total_gt = metricsMidAll['num_objects'][0,:].sum()
+    # total_misses = metricsMidAll['num_misses'][0,:].sum()
+    # total_detections = metricsMidAll['num_detections'][0,:].sum()
+    # total_fp = metricsMidAll['num_false_positives'][0,:].sum()
+    # total_sw = metricsMidAll['num_switches'][0,:].sum()
+    #
+    # print(f"{'TOTAL':<12} {total_gt:<10.0f} "
+    #       f"{total_misses:<10.0f} "
+    #       f"{total_detections:<12.0f} "
+    #       f"{total_fp:<12.0f} "
+    #       f"{total_sw:<10.0f}")
+    #
+    # print("\n  MOTA = 1 - (Misses + ID_Switches + FP) / GT")
+    # print("  ID switches are spatial joint-level only (person-level switches removed).")
+    # print("="*130 + "\n")
 
 #    if (bSaveAll):
     if False:

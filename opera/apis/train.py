@@ -250,23 +250,23 @@ def train_model(model,
         runner.load_checkpoint(cfg.load_from)
     
     # Run initial validation before training starts (only if checkpoint was loaded)
-    if validate and eval_hook_instance is not None and (cfg.resume_from or cfg.load_from):
-        try:
-            logger.info('Running initial validation before training...')
-            if distributed:
-                results = multi_gpu_test(runner.model, val_dataloader)
-            else:
-                results = single_gpu_test(runner.model, val_dataloader)
+    # if validate and eval_hook_instance is not None and (cfg.resume_from or cfg.load_from):
+    #     try:
+    #         logger.info('Running initial validation before training...')
+    #         if distributed:
+    #             results = multi_gpu_test(runner.model, val_dataloader)
+    #         else:
+    #             results = single_gpu_test(runner.model, val_dataloader)
             
-            # Check if results contain predictions
-            if results and len(results) > 0:
-                # Compute and log validation metrics
-                eval_hook_instance.latest_results = results
-                eval_hook_instance.evaluate(runner, results)
-                logger.info('Initial validation completed.')
-            else:
-                logger.info('No predictions generated in initial validation.')
-        except Exception as e:
-            logger.warning(f'Initial validation failed: {e}. Skipping initial validation.')
+    #         # Check if results contain predictions
+    #         if results and len(results) > 0:
+    #             # Compute and log validation metrics
+    #             eval_hook_instance.latest_results = results
+    #             eval_hook_instance.evaluate(runner, results)
+    #             logger.info('Initial validation completed.')
+    #         else:
+    #             logger.info('No predictions generated in initial validation.')
+    #     except Exception as e:
+    #         logger.warning(f'Initial validation failed: {e}. Skipping initial validation.')
     
     runner.run(data_loaders, cfg.workflow)

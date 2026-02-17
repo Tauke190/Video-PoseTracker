@@ -103,6 +103,15 @@ def parse_args():
         choices=['none', 'pytorch', 'slurm', 'mpi'],
         default='none',
         help='job launcher')
+    parser.add_argument(
+        '--eval-from-json',
+        type=str,
+        default=None,
+        help='Recompute metrics from previously saved JSON result '
+        'directories. Pass the save_dir that contains '
+        'val_set_json_results_ap/, val_set_json_results/, and '
+        'val_set_json_results_joint_filtered/ subdirectories. '
+        'Skips model loading and inference entirely.')
     parser.add_argument('--local_rank', type=int, default=0)
     args = parser.parse_args()
     if 'LOCAL_RANK' not in os.environ:
@@ -120,6 +129,21 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    # --- Fast path: recompute metrics from saved JSONs (no model needed) ---
+    if args.eval_from_json is not None:
+        cfg = Config.fromfile(args.config)
+        cfg = replace_cfg_vals(cfg)
+        update_data_root(cfg)
+        if args.cfg_options is not None:
+            cfg.merge_from_dict(args.cfg_options)
+        cfg = compat_cfg(cfg)
+        if isinstance(cfg.data.test, dict):
+            cfg.data.test.test_mode = True
+        dataset = build_dataset(cfg.data.test)
+        metric, mean_ap = dataset.evaluate_from_json(args.eval_from_json)
+        print(metric)
+        return
 
     assert args.out or args.eval or args.format_only or args.show \
         or args.show_dir, \

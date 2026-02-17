@@ -3,6 +3,7 @@ import argparse
 import copy
 import os
 import os.path as osp
+import sys
 import time
 import warnings
 
@@ -182,6 +183,11 @@ def main():
     timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
     log_file = osp.join(cfg.work_dir, f'{timestamp}.log')
     logger = get_root_logger(log_file=log_file, log_level=cfg.log_level)
+
+    # Redirect stdout/stderr to the log file so all print() output is captured
+    log_fh = open(log_file, 'a')
+    sys.stdout = log_fh
+    sys.stderr = log_fh
 
     # init the meta dict to record some important information such as
     # environment info and seed, which will be logged

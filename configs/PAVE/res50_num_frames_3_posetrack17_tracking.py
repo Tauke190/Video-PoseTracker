@@ -30,6 +30,6 @@ load_from = 'Weights/resnet50_posetrack.pth'
 
 # Lower LR for fine-tuning
 optimizer = dict(lr=1e-5)
-lr_config = dict(policy='step', step=[7])
+lr_config = dict(policy='step', step=[40])
 runner = dict(type='EpochBasedRunner', max_epochs=10)
 checkpoint_config = dict(interval=1, max_keep_ckpts=10)

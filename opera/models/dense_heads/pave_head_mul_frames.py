@@ -966,7 +966,7 @@ class PAVEHeadMulFrames(AnchorFreeHead):
         all_gt_track_ids = [gt_track_ids for _ in range(num_dec_layers)]
 
         losses_cls, losses_kpt, losses_oks, kpt_preds_list, kpt_targets_list, \
-            area_targets_list, kpt_weights_list = multi_apply(
+            area_targets_list, kpt_weights_list, track_metrics_list = multi_apply(
                 self.loss_single, all_cls_scores, all_kpt_preds, all_sigma_preds,
                 all_gt_labels_list, all_gt_keypoints_list,
                 all_gt_areas_list, img_metas_list,
@@ -1004,6 +1004,16 @@ class PAVEHeadMulFrames(AnchorFreeHead):
         # loss_hm = self.loss_heatmap(hm_pred, hm_mask, gt_keypoints_list,
         #                             gt_labels_list, gt_bboxes_list)
         # loss_dict['loss_hm'] = loss_hm
+
+        # Track query diagnostic metrics (from last decoder layer, detached)
+        tm = track_metrics_list[-1]
+        loss_dict['trk_kpt_l1'] = tm['track_kpt_l1']
+        loss_dict['det_kpt_l1'] = tm['detect_kpt_l1']
+        loss_dict['n_trk'] = tm['n_track']
+        loss_dict['n_trk_pos'] = tm['n_track_pos']
+        loss_dict['n_det_pos'] = tm['n_detect_pos']
+        id_total = tm['track_id_total'].item()
+        loss_dict['trk_id_con'] = tm['track_id_consistent'] / max(id_total, 1.0)
 
         return loss_dict, (kpt_preds_list[-1], kpt_targets_list[-1],
                            area_targets_list[-1], kpt_weights_list[-1])
@@ -1178,8 +1188,69 @@ class PAVEHeadMulFrames(AnchorFreeHead):
                 pos_areas,
                 avg_factor=num_total_pos)
 
+        # ---- Track query diagnostic metrics (detached, logging only) ----
+        track_metrics = {}
+        device = kpt_preds.device
+        num_query_per_img = kpt_preds.shape[0] // num_imgs
+        if n_track > 0 and num_imgs > 0:
+            # pos_inds is a flat boolean mask over [num_imgs * num_query]
+            # For sequential training (num_imgs=1), query i < n_track is a track query
+            pos_indices = pos_inds.nonzero(as_tuple=True)[0]  # absolute indices
+            track_pos = pos_indices[pos_indices < n_track]
+            detect_pos = pos_indices[pos_indices >= n_track]
+
+            # Per-query L1 keypoint error (as proxy metric, detached)
+            if len(track_pos) > 0:
+                track_l1 = (kpt_preds[track_pos] - kpt_targets[track_pos]).abs()
+                track_l1 = (track_l1 * kpt_weights[track_pos]).sum() / max(kpt_weights[track_pos].sum(), 1.0)
+                track_metrics['track_kpt_l1'] = track_l1.detach()
+            else:
+                track_metrics['track_kpt_l1'] = torch.tensor(0.0, device=device)
+
+            if len(detect_pos) > 0:
+                detect_l1 = (kpt_preds[detect_pos] - kpt_targets[detect_pos]).abs()
+                detect_l1 = (detect_l1 * kpt_weights[detect_pos]).sum() / max(kpt_weights[detect_pos].sum(), 1.0)
+                track_metrics['detect_kpt_l1'] = detect_l1.detach()
+            else:
+                track_metrics['detect_kpt_l1'] = torch.tensor(0.0, device=device)
+
+            track_metrics['n_track_pos'] = torch.tensor(float(len(track_pos)), device=device)
+            track_metrics['n_detect_pos'] = torch.tensor(float(len(detect_pos)), device=device)
+            track_metrics['n_track'] = torch.tensor(float(n_track), device=device)
+
+            # Track ID consistency: how many track queries re-matched the same person
+            id_consistent = 0
+            id_total = 0
+            if (prev_track_gt_ids is not None and gt_track_ids is not None
+                    and hasattr(self, '_last_assigned_gt_inds_per_img')
+                    and len(self._last_assigned_gt_inds_per_img) > 0):
+                assigned = self._last_assigned_gt_inds_per_img[0]  # [num_query] for image 0
+                gt_tids = gt_track_ids[0] if len(gt_track_ids) > 0 else None
+                if gt_tids is not None:
+                    for qi in range(min(n_track, len(assigned))):
+                        prev_tid = prev_track_gt_ids[qi].item() if qi < len(prev_track_gt_ids) else -1
+                        if prev_tid < 0:
+                            continue
+                        id_total += 1
+                        gi = assigned[qi].item()  # 1-based GT index, 0 = background
+                        if gi > 0 and (gi - 1) < len(gt_tids):
+                            cur_tid = gt_tids[gi - 1].item()
+                            if cur_tid == prev_tid:
+                                id_consistent += 1
+            track_metrics['track_id_consistent'] = torch.tensor(float(id_consistent), device=device)
+            track_metrics['track_id_total'] = torch.tensor(float(id_total), device=device)
+        else:
+            # No track queries in this pass
+            track_metrics['track_kpt_l1'] = torch.tensor(0.0, device=device)
+            track_metrics['detect_kpt_l1'] = torch.tensor(0.0, device=device)
+            track_metrics['n_track_pos'] = torch.tensor(0.0, device=device)
+            track_metrics['n_detect_pos'] = torch.tensor(float(pos_inds.sum().item()), device=device)
+            track_metrics['n_track'] = torch.tensor(0.0, device=device)
+            track_metrics['track_id_consistent'] = torch.tensor(0.0, device=device)
+            track_metrics['track_id_total'] = torch.tensor(0.0, device=device)
+
         return loss_cls, loss_kpt, loss_oks, kpt_preds, kpt_targets, \
-            area_targets, kpt_weights
+            area_targets, kpt_weights, track_metrics
 
     def get_targets(self,
                     cls_scores_list,
