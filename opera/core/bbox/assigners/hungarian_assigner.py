@@ -151,16 +151,37 @@ class PoseHungarianAssigner(BaseAssigner):
 
 @BBOX_ASSIGNERS.register_module()
 class TrackAwarePoseHungarianAssigner(PoseHungarianAssigner):
-    """Extends PoseHungarianAssigner with a track-consistency prior.
+    """TrackFormer-style hard identity assignment for track queries.
 
-    When track queries from a previous window are present, this assigner
-    adds a strong bonus (-track_bonus) to the cost matrix entry for
-    re-matching a track query to the GT with the same track_id.
+    Following TrackFormer (Section 3.3), the assignment is split into
+    three groups — track queries never compete with detect queries:
+
+    1. Track queries whose previous GT is still present in the current frame
+       are **hard-assigned** to that GT by identity (no cost comparison).
+    2. Track queries whose GT left the scene (or injected FP queries with
+       prev_track_id < 0) are hard-assigned to **background**.
+    3. Only the *remaining* GTs (new persons or those whose track query was
+       dropped by false-negative augmentation) participate in Hungarian
+       matching, and only against **detect queries**.
+
+    This eliminates the detect-query specialisation problem because detect
+    queries must always cover new objects and any tracked persons whose
+    queries were randomly dropped (pFN augmentation).
+
+    Diagnostics stored after each call:
+        n_hard_matched  – track queries that found their GT
+        n_hard_bg       – track queries assigned to background
     """
 
-    def __init__(self, track_bonus=10.0, **kwargs):
+    def __init__(self, **kwargs):
+        # No bonus / penalty needed — hard assignment replaces them.
+        # Accept (and ignore) legacy keys so old configs don't crash.
+        kwargs.pop('track_bonus', None)
+        kwargs.pop('track_penalty', None)
         super().__init__(**kwargs)
-        self.track_bonus = track_bonus
+        # Diagnostics (read by loss_single for logging)
+        self.n_hard_matched = 0
+        self.n_hard_bg = 0
 
     def assign(self,
                cls_pred,
@@ -180,52 +201,117 @@ class TrackAwarePoseHungarianAssigner(PoseHungarianAssigner):
         if num_gts == 0 or num_kpts == 0:
             if num_gts == 0:
                 assigned_gt_inds[:] = 0
+            self.n_hard_matched = 0
+            self.n_hard_bg = 0
             return AssignResult(
                 num_gts, assigned_gt_inds, None, labels=assigned_labels)
 
-        img_h, img_w, _ = img_meta['img_shape']
-        factor = gt_keypoints.new_tensor([img_w, img_h, img_w,
-                                          img_h]).unsqueeze(0)
+        # ------------------------------------------------------------------
+        # Step 1: Hard-assign track queries by identity
+        # ------------------------------------------------------------------
+        hard_assigned_query_set = set()   # query indices already decided
+        hard_assigned_gt_set = set()      # GT indices consumed by track queries
+        n_hard_matched = 0
+        n_hard_bg = 0
 
-        # classification cost
-        cls_cost = self.cls_cost(cls_pred, gt_labels)
-
-        # keypoint regression L1 cost
-        gt_keypoints_reshape = gt_keypoints.reshape(gt_keypoints.shape[0], -1, 3)
-        valid_kpt_flag = gt_keypoints_reshape[..., -1]
-        kpt_pred_tmp = kpt_pred.clone().detach().reshape(kpt_pred.shape[0], -1, 2)
-        normalize_gt_keypoints = gt_keypoints_reshape[..., :2] / factor[:, :2].unsqueeze(0)
-        kpt_cost = self.kpt_cost(kpt_pred_tmp, normalize_gt_keypoints, valid_kpt_flag)
-
-        # keypoint OKS cost
-        kpt_pred_tmp = kpt_pred.clone().detach().reshape(kpt_pred.shape[0], -1, 2)
-        kpt_pred_tmp = kpt_pred_tmp * factor[:, :2].unsqueeze(0)
-        oks_cost = self.oks_cost(kpt_pred_tmp, gt_keypoints_reshape[..., :2],
-                                 valid_kpt_flag, gt_areas)
-
-        cost = cls_cost + kpt_cost + oks_cost
-
-        # Track-consistency prior: strong bonus for re-matching
         if n_track > 0 and prev_track_gt_ids is not None and gt_track_ids is not None:
             for i in range(min(n_track, num_kpts)):
-                prev_tid = prev_track_gt_ids[i].item() if isinstance(prev_track_gt_ids[i], torch.Tensor) else prev_track_gt_ids[i]
+                prev_tid = (prev_track_gt_ids[i].item()
+                            if isinstance(prev_track_gt_ids[i], torch.Tensor)
+                            else prev_track_gt_ids[i])
                 if prev_tid < 0:
+                    # FP-injected query or invalid → background
+                    assigned_gt_inds[i] = 0
+                    hard_assigned_query_set.add(i)
+                    n_hard_bg += 1
                     continue
+
+                # Find this track's GT in the current frame
+                matched_gt = -1
                 for j in range(num_gts):
-                    gt_tid = gt_track_ids[j].item() if isinstance(gt_track_ids[j], torch.Tensor) else gt_track_ids[j]
+                    gt_tid = (gt_track_ids[j].item()
+                              if isinstance(gt_track_ids[j], torch.Tensor)
+                              else gt_track_ids[j])
                     if gt_tid == prev_tid:
-                        cost[i, j] -= self.track_bonus
+                        matched_gt = j
+                        break
 
-        cost = cost.detach().cpu()
-        if linear_sum_assignment is None:
-            raise ImportError('Please run "pip install scipy" to install scipy first.')
-        matched_row_inds, matched_col_inds = linear_sum_assignment(cost)
-        matched_row_inds = torch.from_numpy(matched_row_inds).to(kpt_pred.device)
-        matched_col_inds = torch.from_numpy(matched_col_inds).to(kpt_pred.device)
+                hard_assigned_query_set.add(i)
+                if matched_gt >= 0:
+                    # GT still present → hard-assign (1-based index)
+                    assigned_gt_inds[i] = matched_gt + 1
+                    assigned_labels[i] = gt_labels[matched_gt]
+                    hard_assigned_gt_set.add(matched_gt)
+                    n_hard_matched += 1
+                else:
+                    # GT left the scene → background
+                    assigned_gt_inds[i] = 0
+                    n_hard_bg += 1
 
-        assigned_gt_inds[:] = 0
-        assigned_gt_inds[matched_row_inds] = matched_col_inds + 1
-        assigned_labels[matched_row_inds] = gt_labels[matched_col_inds]
+        self.n_hard_matched = n_hard_matched
+        self.n_hard_bg = n_hard_bg
+
+        # ------------------------------------------------------------------
+        # Step 2: Hungarian matching — detect queries vs remaining GTs
+        # ------------------------------------------------------------------
+        detect_inds = [i for i in range(num_kpts)
+                       if i not in hard_assigned_query_set]
+        remaining_gt_inds = [j for j in range(num_gts)
+                             if j not in hard_assigned_gt_set]
+
+        if len(detect_inds) > 0 and len(remaining_gt_inds) > 0:
+            det_idx = torch.tensor(detect_inds, dtype=torch.long,
+                                   device=kpt_pred.device)
+            gt_idx = torch.tensor(remaining_gt_inds, dtype=torch.long,
+                                  device=kpt_pred.device)
+
+            detect_cls_pred = cls_pred[det_idx]
+            detect_kpt_pred = kpt_pred[det_idx]
+            rem_gt_labels = gt_labels[gt_idx]
+            rem_gt_kpts = gt_keypoints[gt_idx]
+            rem_gt_areas = gt_areas[gt_idx]
+
+            img_h, img_w, _ = img_meta['img_shape']
+            factor = gt_keypoints.new_tensor(
+                [img_w, img_h, img_w, img_h]).unsqueeze(0)
+
+            # Classification cost
+            cls_cost = self.cls_cost(detect_cls_pred, rem_gt_labels)
+
+            # Keypoint L1 cost
+            gt_kpts_r = rem_gt_kpts.reshape(len(remaining_gt_inds), -1, 3)
+            valid_flag = gt_kpts_r[..., -1]
+            kpt_tmp = detect_kpt_pred.clone().detach().reshape(
+                len(detect_inds), -1, 2)
+            norm_gt = gt_kpts_r[..., :2] / factor[:, :2].unsqueeze(0)
+            kpt_cost = self.kpt_cost(kpt_tmp, norm_gt, valid_flag)
+
+            # Keypoint OKS cost
+            kpt_tmp2 = detect_kpt_pred.clone().detach().reshape(
+                len(detect_inds), -1, 2)
+            kpt_tmp2 = kpt_tmp2 * factor[:, :2].unsqueeze(0)
+            oks_cost = self.oks_cost(kpt_tmp2, gt_kpts_r[..., :2],
+                                     valid_flag, rem_gt_areas)
+
+            cost = (cls_cost + kpt_cost + oks_cost).detach().cpu()
+            if linear_sum_assignment is None:
+                raise ImportError(
+                    'Please run "pip install scipy" to install scipy first.')
+            m_rows, m_cols = linear_sum_assignment(cost)
+            m_rows = torch.from_numpy(m_rows).to(kpt_pred.device)
+            m_cols = torch.from_numpy(m_cols).to(kpt_pred.device)
+
+            # Map back to original indices
+            for r, c in zip(m_rows, m_cols):
+                orig_q = detect_inds[r.item()]
+                orig_g = remaining_gt_inds[c.item()]
+                assigned_gt_inds[orig_q] = orig_g + 1
+                assigned_labels[orig_q] = gt_labels[orig_g]
+
+        # ------------------------------------------------------------------
+        # Step 3: Everything still unassigned → background
+        # ------------------------------------------------------------------
+        assigned_gt_inds[assigned_gt_inds == -1] = 0
         return AssignResult(
             num_gts, assigned_gt_inds, None, labels=assigned_labels)
 

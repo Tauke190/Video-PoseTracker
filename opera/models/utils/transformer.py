@@ -7359,6 +7359,7 @@ class TransformerMulFrames(Transformer):
                  two_stage_num_proposals=300,
                  num_keypoints=17,
                  num_frames=3,
+                 reanchor_alpha=0.0,
                  **kwargs):
         super(TransformerMulFrames, self).__init__(**kwargs)
         self.as_two_stage = as_two_stage
@@ -7367,6 +7368,7 @@ class TransformerMulFrames(Transformer):
         self.embed_dims = self.encoder.embed_dims
         self.num_keypoints = num_keypoints
         self.num_frames = num_frames
+        self.reanchor_alpha = reanchor_alpha
         # self.hm_encoder = build_transformer_layer_sequence(hm_encoder)
         self.refine_decoder = build_transformer_layer_sequence(refine_decoder)
         self.init_layers()
@@ -7708,6 +7710,38 @@ class TransformerMulFrames(Transformer):
             detect_query = query_embed_val[:n_detect].unsqueeze(0).expand(bs // self.num_frames, -1, -1)
             detect_query = tgt_detach + detect_query
             detect_refs_3frames = detect_refs.repeat(1, self.num_frames, 1)
+
+            # ── Pose-Aware Re-Anchoring ──────────────────────────────────
+            # Instead of letting track queries keep stale reference points
+            # from frame t-1, match each track query to the nearest encoder
+            # proposal in the *current* frame and blend the references.
+            # Identity is preserved through the query content (hidden state);
+            # only the spatial anchor is refreshed.
+            if n_track > 0 and track_reference_points is not None and self.reanchor_alpha > 0:
+                with torch.no_grad():
+                    all_enc_kpts = enc_outputs_kpt_unact.sigmoid()       # [bs//3, N_enc, K*2]
+                    enc_scores = enc_outputs_class.sigmoid().squeeze(-1)  # [bs//3, N_enc]
+
+                    # Pre-filter to top-M proposals to bound memory
+                    M = min(300, all_enc_kpts.shape[1])
+                    _, top_m_inds = enc_scores.topk(M, dim=1)            # [bs//3, M]
+                    top_m_kpts = torch.gather(
+                        all_enc_kpts, 1,
+                        top_m_inds.unsqueeze(-1).expand(-1, -1, all_enc_kpts.size(-1)))  # [bs//3, M, K*2]
+
+                    # Mean-squared-error across keypoints → [bs//3, n_track, M]
+                    dists = ((track_reference_points.unsqueeze(2) -
+                              top_m_kpts.unsqueeze(1)) ** 2).mean(-1)
+                    nearest_idx = dists.argmin(dim=2)                    # [bs//3, n_track]
+
+                    matched_refs = torch.gather(
+                        top_m_kpts, 1,
+                        nearest_idx.unsqueeze(-1).expand(-1, -1, top_m_kpts.size(-1)))  # [bs//3, n_track, K*2]
+
+                # Blend: alpha × current-frame proposal + (1-alpha) × stale prediction
+                a = self.reanchor_alpha
+                track_reference_points = a * matched_refs + (1.0 - a) * track_reference_points
+            # ─────────────────────────────────────────────────────────────
 
             if n_track > 0:
                 # Concatenate: track queries first, detect queries second

@@ -14,32 +14,35 @@ export PYTHONPATH=/home/av354855/projects/PAVENet:$PYTHONPATH
 #   --cfg-options        : Override config options
 
 # ============ Configurable Parameters ============
-SAMPLES_PER_GPU=1          # Batch size per GPU
+SAMPLES_PER_GPU=2          # Batch size per GPU
 GPU_ID=0                   # Which GPU to use
-CUDA_DEVICE=0              # CUDA_VISIBLE_DEVICES value
+CUDA_DEVICE=2              # CUDA_VISIBLE_DEVICES value
 # =================================================
 
-COCO=configs/_base_/datasets/coco_keypoint.py
-POSETRACK=configs/PAVE/res50_num_frames_3_posetrack17.py
-CROWDPOSE=opera/datasets/crowd_pose.py
-WEIGHTs=work_dirs/res50_num_frames_3_posetrack17/epoch_11.pth
-WORK_DIR=work_dirs/res50_num_frames_3_posetrack17
+# COCO=configs/_base_/datasets/coco_keypoint.py
+# POSETRACK=configs/PAVE/res50_num_frames_3_posetrack17.py
+# CROWDPOSE=opera/datasets/crowd_pose.py
 
+POSETRACK_TRACKING=configs/PAVE/res50_num_frames_3_posetrack17_tracking.py
+WEIGHTs=work_dirs/res50_num_frames_3_posetrack17_tracking/epoch_10.pth
+# WORK_DIR=work_dirs/res50_num_frames_3_posetrack17
 # Weights/resnet50_posetrack.pth
 
 # Run evaluation on PoseTrack17 validation set
+# IMPORTANT: Use tracking config for trained tracking checkpoint to enable track-aware assignment
+EVAL_WORK_DIR=work_dirs/eval_results_pavenet_tracking_epoch1
+
 CUDA_VISIBLE_DEVICES=$CUDA_DEVICE python tools/test.py \
-    configs/PAVE/res50_num_frames_3_posetrack17.py \
+    $POSETRACK_TRACKING \
     $WEIGHTs \
     --eval keypoints \
     --gpu-id $GPU_ID \
     --cfg-options data.samples_per_gpu=$SAMPLES_PER_GPU \
-    --work-dir work_dirs/eval_results_pavenet \
-    --eval-options score_thr=0.5 joint_score_thr=0.1 
-    # --work-dir $WORK_DIR
+    --work-dir $EVAL_WORK_DIR \
+    --eval-options score_thr=0.5 joint_score_thr=0.1 save_dir=$EVAL_WORK_DIR
 
 #CrowdPose evaluation
-# CUDA_VISIBLE_DEVICES=$CUDA_DEVICE python tools/test.py \
+#CUDA_VISIBLE_DEVICES=$CUDA_DEVICE python tools/test.py \
 #     configs/PAVE/res50_num_frames_3_posetrack17.py \
 #     Weights/petr_swin-l-p4-w7-_16x1_100e_crowdpose.pth \
 #     --eval keypoints \

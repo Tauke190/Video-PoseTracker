@@ -24,9 +24,13 @@ def _calc_dynamic_intervals(start_interval, dynamic_interval_list):
 
 class EvalHook(BaseEvalHook):
 
-    def __init__(self, *args, dynamic_intervals=None, **kwargs):
+    def __init__(self, *args, dynamic_intervals=None,
+                 val_iter_interval=None, **kwargs):
         super(EvalHook, self).__init__(*args, **kwargs)
         self.latest_results = None
+
+        # Mid-epoch validation: evaluate every val_iter_interval batches.
+        self.val_iter_interval = val_iter_interval
 
         self.use_dynamic_intervals = dynamic_intervals is not None
         if self.use_dynamic_intervals:
@@ -48,6 +52,52 @@ class EvalHook(BaseEvalHook):
     def before_train_iter(self, runner):
         self._decide_interval(runner)
         super().before_train_iter(runner)
+
+    def after_train_iter(self, runner):
+        """Mid-epoch validation at every val_iter_interval batches."""
+        # Call parent for iter-based eval (by_epoch=False case)
+        super().after_train_iter(runner)
+        # Additionally, support mid-epoch eval for EpochBasedRunner
+        if (self.val_iter_interval is not None
+                and self.by_epoch
+                and self.every_n_inner_iters(runner, self.val_iter_interval)):
+            self._run_evaluate(runner)
+
+    def _run_evaluate(self, runner):
+        """Run evaluation (shared by end-of-epoch and mid-epoch paths)."""
+        from opera.apis import single_gpu_test
+        from mmcv.runner.hooks.logger.base import LoggerHook
+
+        # Flush any pending training logs before running evaluation.
+        # This prevents eval metrics from merging with training metrics
+        # when the eval iter coincides with a logging iter.
+        if runner.log_buffer.ready or runner.log_buffer.val_history:
+            if runner.log_buffer.val_history:
+                runner.log_buffer.average(self.val_iter_interval or 1)
+            for hook in runner._hooks:
+                if isinstance(hook, LoggerHook):
+                    hook.log(runner)
+            runner.log_buffer.clear()
+
+        runner.logger.info(
+            f'Mid-epoch validation at epoch {runner.epoch + 1}, '
+            f'iter {runner.inner_iter + 1}')
+        results = single_gpu_test(runner.model, self.dataloader, show=False)
+        # Restore training mode — single_gpu_test sets model.eval()
+        runner.model.train()
+        self.latest_results = results
+        runner.log_buffer.output['eval_iter_num'] = len(self.dataloader)
+        key_score = self.evaluate(runner, results)
+
+        # Log eval results immediately and clear buffer so subsequent
+        # training log lines don't inherit stale validation metrics.
+        for hook in runner._hooks:
+            if isinstance(hook, LoggerHook):
+                hook.log(runner)
+        runner.log_buffer.clear()
+
+        if self.save_best and key_score:
+            self._save_ckpt(runner, key_score)
 
     def _do_evaluate(self, runner):
         """perform evaluation and save ckpt."""
@@ -73,9 +123,13 @@ class EvalHook(BaseEvalHook):
 # inherit EvalHook but BaseDistEvalHook.
 class DistEvalHook(BaseDistEvalHook):
 
-    def __init__(self, *args, dynamic_intervals=None, **kwargs):
+    def __init__(self, *args, dynamic_intervals=None,
+                 val_iter_interval=None, **kwargs):
         super(DistEvalHook, self).__init__(*args, **kwargs)
         self.latest_results = None
+
+        # Mid-epoch validation: evaluate every val_iter_interval batches.
+        self.val_iter_interval = val_iter_interval
 
         self.use_dynamic_intervals = dynamic_intervals is not None
         if self.use_dynamic_intervals:
@@ -97,6 +151,67 @@ class DistEvalHook(BaseDistEvalHook):
     def before_train_iter(self, runner):
         self._decide_interval(runner)
         super().before_train_iter(runner)
+
+    def after_train_iter(self, runner):
+        """Mid-epoch validation at every val_iter_interval batches."""
+        super().after_train_iter(runner)
+        if (self.val_iter_interval is not None
+                and self.by_epoch
+                and self.every_n_inner_iters(runner, self.val_iter_interval)):
+            self._run_evaluate(runner)
+
+    def _run_evaluate(self, runner):
+        """Run evaluation for mid-epoch validation (distributed)."""
+        from mmcv.runner.hooks.logger.base import LoggerHook
+
+        if self.broadcast_bn_buffer:
+            model = runner.model
+            for name, module in model.named_modules():
+                if isinstance(module,
+                              _BatchNorm) and module.track_running_stats:
+                    dist.broadcast(module.running_var, 0)
+                    dist.broadcast(module.running_mean, 0)
+
+        tmpdir = self.tmpdir
+        if tmpdir is None:
+            tmpdir = osp.join(runner.work_dir, '.eval_hook')
+
+        from opera.apis import multi_gpu_test
+
+        # Flush pending training logs before eval (same as single-GPU path)
+        if runner.rank == 0:
+            if runner.log_buffer.ready or runner.log_buffer.val_history:
+                if runner.log_buffer.val_history:
+                    runner.log_buffer.average(self.val_iter_interval or 1)
+                for hook in runner._hooks:
+                    if isinstance(hook, LoggerHook):
+                        hook.log(runner)
+                runner.log_buffer.clear()
+
+        runner.logger.info(
+            f'Mid-epoch validation at epoch {runner.epoch + 1}, '
+            f'iter {runner.inner_iter + 1}')
+        results = multi_gpu_test(
+            runner.model,
+            self.dataloader,
+            tmpdir=tmpdir,
+            gpu_collect=self.gpu_collect)
+        # Restore training mode — multi_gpu_test sets model.eval()
+        runner.model.train()
+        self.latest_results = results
+        if runner.rank == 0:
+            print('\n')
+            runner.log_buffer.output['eval_iter_num'] = len(self.dataloader)
+            key_score = self.evaluate(runner, results)
+
+            # Log eval results immediately and clear buffer
+            for hook in runner._hooks:
+                if isinstance(hook, LoggerHook):
+                    hook.log(runner)
+            runner.log_buffer.clear()
+
+            if self.save_best and key_score:
+                self._save_ckpt(runner, key_score)
 
     def _do_evaluate(self, runner):
         """perform evaluation and save ckpt."""

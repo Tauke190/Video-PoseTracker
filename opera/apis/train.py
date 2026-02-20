@@ -225,9 +225,71 @@ def train_model(model,
                 cfg.data.val.pipeline)
         val_dataset = build_dataset(cfg.data.val, dict(test_mode=True))
 
-        val_dataloader = build_dataloader(val_dataset, **val_dataloader_args)
         eval_cfg = cfg.get('evaluation', {})
         eval_cfg['by_epoch'] = cfg.runner['type'] != 'IterBasedRunner'
+
+        # Subsample validation set for fast intra-epoch feedback.
+        # Set evaluation.val_samples in the config to an integer to
+        # validate on only that many images (randomly chosen).
+        val_samples = eval_cfg.pop('val_samples', None)
+        if val_samples is not None and val_samples < len(val_dataset):
+            logger = get_root_logger()
+            total = len(val_dataset)
+            # Fixed seed so the same subset is used every validation run,
+            # making metrics comparable across epochs and runs.
+            rng = np.random.RandomState(42)
+            indices = sorted(
+                rng.choice(total, val_samples, replace=False))
+            val_dataset.data_infos = [
+                val_dataset.data_infos[i] for i in indices]
+
+            # Derive keep_ids from the subsampled data_infos (the
+            # authoritative source). img_ids and data_infos can have
+            # different lengths in test_mode because _filter_imgs is
+            # skipped, so we must NOT index img_ids by the same indices.
+            keep_ids = set(info['id'] for info in val_dataset.data_infos)
+            if hasattr(val_dataset, 'img_ids'):
+                val_dataset.img_ids = [
+                    iid for iid in val_dataset.img_ids
+                    if iid in keep_ids]
+
+            # Also filter the COCO GT object so that evaluation metrics
+            # are computed only against the subsampled images, not the
+            # full validation set.
+            if hasattr(val_dataset, 'coco'):
+                from collections import defaultdict
+                coco = val_dataset.coco
+                coco.dataset['images'] = [
+                    img for img in coco.dataset['images']
+                    if img['id'] in keep_ids]
+                coco.dataset['annotations'] = [
+                    ann for ann in coco.dataset['annotations']
+                    if ann['image_id'] in keep_ids]
+                # Rebuild all COCO index structures
+                coco.imgs = {img['id']: img
+                             for img in coco.dataset['images']}
+                coco.anns = {ann['id']: ann
+                             for ann in coco.dataset['annotations']}
+                coco.imgToAnns = defaultdict(list)
+                for ann in coco.dataset['annotations']:
+                    coco.imgToAnns[ann['image_id']].append(ann)
+                coco.catToImgs = defaultdict(list)
+                for ann in coco.dataset['annotations']:
+                    coco.catToImgs[ann['category_id']].append(
+                        ann['image_id'])
+                # Some datasets use cat_img_map as alias
+                if hasattr(coco, 'cat_img_map'):
+                    coco.cat_img_map = coco.catToImgs
+
+            logger.info(
+                f'Using val_samples={val_samples}: subsampled validation '
+                f'set from {total} to {len(val_dataset)} images.')
+
+            # Use fast COCO-only evaluation for subset validation
+            # (skips full PoseTrack evaluation that needs external GT files)
+            eval_cfg['subset_eval'] = True
+
+        val_dataloader = build_dataloader(val_dataset, **val_dataloader_args)
         
         # 添加保存日志路径,便于验证时保存推理结果 --- 修改时间 2024-8-02
         eval_cfg['save_dir'] = cfg.work_dir

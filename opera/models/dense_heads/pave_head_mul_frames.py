@@ -91,11 +91,21 @@ class PAVEHeadMulFrames(AnchorFreeHead):
                  loss_oks_refine=dict(type='opera.OKSLoss', loss_weight=2.0),
                  test_cfg=dict(max_per_img=100),
                  init_cfg=None,
+                 track_score_thr=0.9,
+                 max_track_queries=100,
+                 track_nms_thr=0.9,
+                 track_p_fn=0.4,
+                 track_train_score_thr=0.3,
                  **kwargs):
         # NOTE here use `AnchorFreeHead` instead of `TransformerHead`,
         # since it brings inconvenience when the initialization of
         # `AnchorFreeHead` is called.
         super(AnchorFreeHead, self).__init__(init_cfg)
+        self.track_score_thr = track_score_thr
+        self.max_track_queries = max_track_queries
+        self.track_nms_thr = track_nms_thr
+        self.track_p_fn = track_p_fn
+        self.track_train_score_thr = track_train_score_thr
         self.bg_cls_weight = 0
         self.sync_cls_avg_factor = sync_cls_avg_factor
         if train_cfg:
@@ -325,7 +335,7 @@ class PAVEHeadMulFrames(AnchorFreeHead):
         
         prior = distributions.MultivariateNormal(torch.zeros(2) + 0.5, torch.eye(2))
         self.flow = RealNVP(nets, nett, masks, prior)
-        
+
     
     def init_weights(self):
         """Initialize weights of the PETR head."""
@@ -403,7 +413,7 @@ class PAVEHeadMulFrames(AnchorFreeHead):
                 self.positional_encoding(mlvl_masks[-1]))
 
         query_embeds = self.query_embedding.weight # shape: num_querys, embed_dims
-        
+
         hs, init_reference, inter_references, \
             enc_outputs_class, enc_outputs_kpt, enc_outputs_sigma, hm_proto, memory, n_track = \
                 self.transformer(
@@ -813,91 +823,118 @@ class PAVEHeadMulFrames(AnchorFreeHead):
 
     def _extract_track_queries(self, cls_scores, kpt_preds, outs_for_loss,
                                 n_track, gt_track_ids, img_metas,
-                                score_thr=0.5, max_track_queries=100):
-        """Extract high-confidence queries for propagation to next window.
+                                score_thr=None, max_track_queries=100,
+                                p_fp=0.1, max_fp=3):
+        """Extract queries for propagation + TrackFormer-style FP injection.
+
+        Threshold-based selection (faithful to TrackFormer): all queries with
+        score > score_thr become track queries for the next window.  Their
+        assigned GT provides track identity.  Uses a lower threshold than
+        inference (0.3 vs 0.5) to prevent score collapse during early training.
+
+        False-positive injection (pFP): a small number of background queries
+        are injected as fake track queries with track_id = -1.  The hard
+        assigner in the next window assigns them to background, teaching the
+        model to suppress stale / wrong track queries.
+
+        Following TrackFormer, each FP candidate is sampled with probability
+        p_fp, but the total is capped at max_fp to avoid drowning the real
+        track queries.
 
         Args:
-            cls_scores (Tensor): [bs//3, num_q, 1] classification scores from last dec layer.
-            kpt_preds (Tensor): [bs//3, num_q, K*2] keypoint predictions from last dec layer.
+            cls_scores (Tensor): [bs//3, num_q, 1] classification scores.
+            kpt_preds (Tensor): [bs//3, num_q, K*2] keypoint predictions.
             outs_for_loss: All outputs for loss computation.
             n_track (int): Number of track queries in current pass.
             gt_track_ids (list[Tensor]): GT track IDs for matching.
             img_metas (list[dict]): Image meta information.
-            score_thr (float): Confidence threshold for track query selection.
-            max_track_queries (int): Maximum number of track queries.
+            score_thr (float): Score threshold for selecting track queries.
+            max_track_queries (int): Hard upper cap on propagated queries.
+            p_fp (float): Per-background-query probability of FP injection.
+            max_fp (int): Maximum number of FP queries injected per step.
 
         Returns:
-            tuple or None: (track_queries, track_refs, track_qpos, track_gt_ids) or None.
+            tuple or None: (track_queries, track_refs, track_qpos, track_gt_ids)
         """
+        import random as _random
+
         if not self.training:
             return None
 
-        # Use scores from last classification layer
+        # Use configured training threshold if not explicitly passed.
+        if score_thr is None:
+            score_thr = getattr(self, 'track_train_score_thr', 0.3)
+
         scores = cls_scores.sigmoid().squeeze(-1)  # [bs//3, num_q]
         bs_div3 = scores.shape[0]
-
-        # For simplicity, operate on first batch element (bs//3 should be 1 during sequential)
         scores_0 = scores[0]  # [num_q]
-        mask = scores_0 > score_thr
-        if mask.sum() == 0:
+
+        # ---- Select positive (foreground) queries above threshold ----
+        valid_mask = scores_0 > score_thr
+        if valid_mask.sum() == 0:
             return None
 
-        # Cap at max_track_queries
-        if mask.sum() > max_track_queries:
-            topk_vals, topk_inds = scores_0.topk(max_track_queries)
-            mask = torch.zeros_like(scores_0, dtype=torch.bool)
-            mask[topk_inds] = True
+        selected_inds = valid_mask.nonzero(as_tuple=True)[0]
+        # Cap at max_track_queries, keeping highest-scoring ones
+        if len(selected_inds) > max_track_queries:
+            _, topk = scores_0[selected_inds].topk(max_track_queries)
+            selected_inds = selected_inds[topk]
 
-        selected_inds = mask.nonzero(as_tuple=True)[0]
-
-        # Extract from the decoder output: use the classification branch input (hs)
-        # We need the actual hidden states. Since we have cls_scores = cls_branches(hs),
-        # we can't invert that. Instead, we construct track queries from the
-        # kpt_preds (reference points) and use a learned embedding as query content.
-        # A simpler approach: re-use the output embeddings from the current query_embedding
-        # weighting by the cls_scores. But the plan suggests using decoder hidden states.
-        # Since we don't directly have hs here, we'll store it during forward().
-
-        # Use stored hs from the forward pass
         if not hasattr(self, '_last_hs') or self._last_hs is None:
             return None
 
         last_hs = self._last_hs  # [bs//3, num_q, 256]
-        track_queries = last_hs[:, selected_inds, :]  # [bs//3, N_sel, 256]
-        # Reference points from current-frame kpt predictions (already sigmoid)
-        track_refs = kpt_preds[:, selected_inds, :]  # [bs//3, N_sel, K*2]
-        # Use zeros for track_query_pos (will be combined with learnable content)
+
+        # ---- FP injection: randomly include a few background queries ----
+        # Background queries = those NOT selected above (low confidence or unmatched)
+        all_inds = set(range(scores_0.shape[0]))
+        pos_set = set(selected_inds.tolist())
+        bg_candidates = sorted(all_inds - pos_set)
+        fp_inds = [idx for idx in bg_candidates if _random.random() < p_fp]
+        # Cap at max_fp to avoid drowning real track queries
+        if len(fp_inds) > max_fp:
+            fp_inds = _random.sample(fp_inds, max_fp)
+        # Also cap total queries
+        fp_inds = fp_inds[:max(0, max_track_queries - len(selected_inds))]
+        n_fp_injected = len(fp_inds)
+
+        # Combine positive + FP indices
+        if fp_inds:
+            fp_tensor = torch.tensor(fp_inds, dtype=torch.long,
+                                     device=scores.device)
+            combined_inds = torch.cat([selected_inds, fp_tensor])
+        else:
+            combined_inds = selected_inds
+
+        track_queries = last_hs[:, combined_inds, :]     # [bs, N, 256]
+        track_refs = kpt_preds[:, combined_inds, :]      # [bs, N, K*2]
         track_qpos = torch.zeros_like(track_queries)
 
-        # Determine GT track IDs for selected queries via Hungarian assignment
-        # We need to know which GT each selected query was assigned to
-        track_gt_ids_list = []
-        if gt_track_ids is not None and hasattr(self, '_last_assigned_gt_inds'):
-            assigned_gt_inds = self._last_assigned_gt_inds  # list of tensors per image
-            for b in range(bs_div3):
-                gt_tids = gt_track_ids[b] if b < len(gt_track_ids) else None
-                if gt_tids is not None and b < len(assigned_gt_inds):
-                    agi = assigned_gt_inds[b]  # [num_q]
-                    sel_agi = agi[selected_inds]  # [N_sel]
-                    tids = torch.full((len(selected_inds),), -1, dtype=torch.int64,
-                                      device=scores.device)
-                    for i, gi in enumerate(sel_agi):
-                        if gi > 0 and (gi - 1) < len(gt_tids):
-                            tids[i] = gt_tids[gi - 1]
-                    track_gt_ids_list.append(tids)
-                else:
-                    track_gt_ids_list.append(
-                        torch.full((len(selected_inds),), -1, dtype=torch.int64,
-                                    device=scores.device))
-        else:
-            track_gt_ids_list.append(
-                torch.full((len(selected_inds),), -1, dtype=torch.int64,
-                            device=scores.device))
+        # ---- Assign GT track IDs ----
+        # Positive queries → their matched GT's track ID
+        # FP queries → -1 (will be hard-assigned to background)
+        n_pos = len(selected_inds)
+        n_total = len(combined_inds)
+        tids = torch.full((n_total,), -1, dtype=torch.int64,
+                          device=scores.device)
 
-        prev_track_gt_ids = track_gt_ids_list[0]  # For single batch
+        has_assigned = hasattr(self, '_last_assigned_gt_inds_decoder')
+        if gt_track_ids is not None and has_assigned:
+            assigned_gt_inds = self._last_assigned_gt_inds_decoder
+            gt_tids = gt_track_ids[0] if len(gt_track_ids) > 0 else None
+            if gt_tids is not None and len(assigned_gt_inds) > 0:
+                agi = assigned_gt_inds[0]  # [num_q]
+                sel_agi = agi[selected_inds]  # [N_pos]
+                for i, gi in enumerate(sel_agi):
+                    if gi > 0 and (gi - 1) < len(gt_tids):
+                        tids[i] = gt_tids[gi - 1]
+        # FP entries (indices n_pos .. n_total-1) keep tid = -1
+
+        # Store FP count for diagnostics
+        self._last_n_fp_injected = n_fp_injected
 
         return (track_queries.detach(), track_refs.detach(),
-                track_qpos.detach(), prev_track_gt_ids.detach())
+                track_qpos.detach(), tids.detach())
 
     @force_fp32(apply_to=('all_cls_scores', 'all_kpt_preds'))
     def loss(self,
@@ -972,6 +1009,10 @@ class PAVEHeadMulFrames(AnchorFreeHead):
                 all_gt_areas_list, img_metas_list,
                 all_n_track, all_prev_track_gt_ids, all_gt_track_ids)
 
+        # Save decoder-level assignments before encoder loss overwrites them.
+        # loss_single_rpn calls get_targets which resets _last_assigned_gt_inds.
+        self._last_assigned_gt_inds_decoder = list(self._last_assigned_gt_inds)
+
         loss_dict = dict()
         # loss of proposal generated from encode feature map.
         if enc_cls_scores is not None:
@@ -1014,6 +1055,12 @@ class PAVEHeadMulFrames(AnchorFreeHead):
         loss_dict['n_det_pos'] = tm['n_detect_pos']
         id_total = tm['track_id_total'].item()
         loss_dict['trk_id_con'] = tm['track_id_consistent'] / max(id_total, 1.0)
+        loss_dict['n_hard_match'] = tm['n_hard_matched']
+        loss_dict['n_hard_bg'] = tm['n_hard_bg']
+        loss_dict['n_fp_inj'] = tm['n_fp_injected']
+        # Per-type classification cost (name avoids "loss" so _parse_losses() skips it)
+        loss_dict['trk_cls_val'] = tm['trk_cls_val']
+        loss_dict['det_cls_val'] = tm['det_cls_val']
 
         return loss_dict, (kpt_preds_list[-1], kpt_targets_list[-1],
                            area_targets_list[-1], kpt_weights_list[-1])
@@ -1121,6 +1168,27 @@ class PAVEHeadMulFrames(AnchorFreeHead):
         loss_cls = self.loss_cls(
             cls_scores, labels, label_weights, avg_factor=cls_avg_factor)
 
+        # ---- Per-query-type classification loss (for logging only) ----
+        # Splits loss_cls into track vs detect components so we can monitor
+        # whether track queries are learning to classify correctly.
+        with torch.no_grad():
+            if n_track > 0 and num_imgs > 0:
+                trk_mask = torch.zeros(cls_scores.shape[0], dtype=torch.bool,
+                                       device=cls_scores.device)
+                trk_mask[:n_track] = True
+                det_mask = ~trk_mask
+                trk_cls_loss = self.loss_cls(
+                    cls_scores[trk_mask], labels[trk_mask],
+                    label_weights[trk_mask],
+                    avg_factor=max(trk_mask.sum().float(), 1.0))
+                det_cls_loss = self.loss_cls(
+                    cls_scores[det_mask], labels[det_mask],
+                    label_weights[det_mask],
+                    avg_factor=max(det_mask.sum().float(), 1.0))
+            else:
+                trk_cls_loss = torch.tensor(0.0, device=cls_scores.device)
+                det_cls_loss = torch.tensor(0.0, device=cls_scores.device)
+
         # Compute the average number of gt keypoints accross all gpus, for
         # normalization purposes
         num_total_pos = loss_cls.new_tensor([num_total_pos])
@@ -1219,12 +1287,13 @@ class PAVEHeadMulFrames(AnchorFreeHead):
             track_metrics['n_track'] = torch.tensor(float(n_track), device=device)
 
             # Track ID consistency: how many track queries re-matched the same person
+            # (with hard assignment this should be ~100% for non-FP queries)
             id_consistent = 0
             id_total = 0
             if (prev_track_gt_ids is not None and gt_track_ids is not None
                     and hasattr(self, '_last_assigned_gt_inds_per_img')
                     and len(self._last_assigned_gt_inds_per_img) > 0):
-                assigned = self._last_assigned_gt_inds_per_img[0]  # [num_query] for image 0
+                assigned = self._last_assigned_gt_inds_per_img[0]
                 gt_tids = gt_track_ids[0] if len(gt_track_ids) > 0 else None
                 if gt_tids is not None:
                     for qi in range(min(n_track, len(assigned))):
@@ -1232,13 +1301,33 @@ class PAVEHeadMulFrames(AnchorFreeHead):
                         if prev_tid < 0:
                             continue
                         id_total += 1
-                        gi = assigned[qi].item()  # 1-based GT index, 0 = background
+                        gi = assigned[qi].item()
                         if gi > 0 and (gi - 1) < len(gt_tids):
                             cur_tid = gt_tids[gi - 1].item()
                             if cur_tid == prev_tid:
                                 id_consistent += 1
             track_metrics['track_id_consistent'] = torch.tensor(float(id_consistent), device=device)
             track_metrics['track_id_total'] = torch.tensor(float(id_total), device=device)
+
+            # Hard-assignment diagnostics from the assigner
+            from opera.core.bbox.assigners.hungarian_assigner import TrackAwarePoseHungarianAssigner
+            if isinstance(self.assigner, TrackAwarePoseHungarianAssigner):
+                track_metrics['n_hard_matched'] = torch.tensor(
+                    float(self.assigner.n_hard_matched), device=device)
+                track_metrics['n_hard_bg'] = torch.tensor(
+                    float(self.assigner.n_hard_bg), device=device)
+            else:
+                track_metrics['n_hard_matched'] = torch.tensor(0.0, device=device)
+                track_metrics['n_hard_bg'] = torch.tensor(0.0, device=device)
+
+            # FP injection count (from _extract_track_queries)
+            n_fp = getattr(self, '_last_n_fp_injected', 0)
+            track_metrics['n_fp_injected'] = torch.tensor(float(n_fp), device=device)
+
+            # Per-type classification cost (for logging only — name avoids "loss"
+            # so _parse_losses() won't add it to the backprop total)
+            track_metrics['trk_cls_val'] = trk_cls_loss
+            track_metrics['det_cls_val'] = det_cls_loss
         else:
             # No track queries in this pass
             track_metrics['track_kpt_l1'] = torch.tensor(0.0, device=device)
@@ -1248,6 +1337,11 @@ class PAVEHeadMulFrames(AnchorFreeHead):
             track_metrics['n_track'] = torch.tensor(0.0, device=device)
             track_metrics['track_id_consistent'] = torch.tensor(0.0, device=device)
             track_metrics['track_id_total'] = torch.tensor(0.0, device=device)
+            track_metrics['n_hard_matched'] = torch.tensor(0.0, device=device)
+            track_metrics['n_hard_bg'] = torch.tensor(0.0, device=device)
+            track_metrics['n_fp_injected'] = torch.tensor(0.0, device=device)
+            track_metrics['trk_cls_val'] = trk_cls_loss
+            track_metrics['det_cls_val'] = det_cls_loss
 
         return loss_cls, loss_kpt, loss_oks, kpt_preds, kpt_targets, \
             area_targets, kpt_weights, track_metrics
@@ -1651,7 +1745,7 @@ class PAVEHeadMulFrames(AnchorFreeHead):
             cls_score = cls_score.sigmoid()
             scores, indexs = cls_score.view(-1).topk(max_per_img)
             det_labels = indexs % self.num_classes
-            bbox_index = indexs // self.num_classes
+            bbox_index = torch.div(indexs, self.num_classes, rounding_mode='floor')
             kpt_pred = kpt_pred[bbox_index]
             if self.num_frames == 5:
                 pre_pre_pose_kpt = pre_pre_pose_kpt.flatten(0, 1)[bbox_index]

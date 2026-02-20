@@ -1,4 +1,5 @@
 # Copyright (c) Hikvision Research Institute. All rights reserved.
+import random
 import mmcv
 import matplotlib.pyplot as plt
 import numpy as np
@@ -20,6 +21,15 @@ class PAVE(DETR):
     """Implementation of `End-to-End Multi-Person Pose Estimation with
     Transformers`"""
 
+    # Keys to show in the training log; all others are suppressed.
+    _LOG_KEYS = {
+        'enc_loss_cls',  # encoder
+        'trk_cls_val', 'det_cls_val',  # per-query-type classification metrics
+        'loss_cls',
+        'loss',
+        'n_trk', 'n_trk_pos', 'n_det_pos', 'trk_id_con',
+    }
+
     def __init__(self, *args, **kwargs):
         super(DETR, self).__init__(*args, **kwargs)
         self.num_iters = 0
@@ -39,6 +49,44 @@ class PAVE(DETR):
         self.track_query_pos = None
         self.track_ids = None
         self.next_track_id = 0
+
+    def train_step(self, data, optimizer, **kwargs):
+        """Override train_step to handle sequential data.
+
+        When using PosetrackSequentialDataset, the dataloader returns a list
+        of T collated dicts (one per time step). The default train_step does
+        self(**data) which fails because data is a list, not a dict.
+        """
+        if isinstance(data, list):
+            # Sequential training: data is [dict_t0, dict_t1, ...]
+            # Each dict has keys: img, img_metas, gt_bboxes, gt_labels, etc.
+            T = len(data)
+            imgs = [data[t]['img'] for t in range(T)]
+            img_metas_list = [data[t]['img_metas'] for t in range(T)]
+            gt_bboxes_list = [data[t]['gt_bboxes'] for t in range(T)]
+            gt_labels_list = [data[t]['gt_labels'] for t in range(T)]
+            gt_keypoints_list = [data[t]['gt_keypoints'] for t in range(T)]
+            gt_areas_list = [data[t]['gt_areas'] for t in range(T)]
+            gt_track_ids_list = [data[t].get('gt_track_ids') for t in range(T)]
+
+            losses = self.forward_train(
+                imgs, img_metas_list, gt_bboxes_list, gt_labels_list,
+                gt_keypoints_list, gt_areas_list,
+                gt_track_ids=gt_track_ids_list)
+
+            loss, log_vars = self._parse_losses(losses)
+            log_vars = {k: v for k, v in log_vars.items() if k in self._LOG_KEYS}
+            outputs = dict(
+                loss=loss, log_vars=log_vars,
+                num_samples=len(data[0]['img_metas']))
+            return outputs
+        else:
+            # Standard single-frame training
+            outputs = super().train_step(data, optimizer, **kwargs)
+            outputs['log_vars'] = {
+                k: v for k, v in outputs['log_vars'].items()
+                if k in self._LOG_KEYS}
+            return outputs
 
     def forward_train(self,
                       img,
@@ -71,13 +119,18 @@ class PAVE(DETR):
         Returns:
             dict[str, Tensor]: A dictionary of loss components.
         """
-        super(SingleStageDetector, self).forward_train(img, img_metas)
-
         # Check if this is sequential training (img is list of T tensors)
         if isinstance(img, (list, tuple)):
+            # Set batch_input_shape per window (normally done by super().forward_train)
+            for t in range(len(img)):
+                batch_input_shape = tuple(img[t].size()[-2:])
+                for meta in img_metas[t]:
+                    meta['batch_input_shape'] = batch_input_shape
             return self._forward_train_sequential(
                 img, img_metas, gt_bboxes, gt_labels,
                 gt_keypoints, gt_areas, gt_track_ids, gt_bboxes_ignore)
+
+        super(SingleStageDetector, self).forward_train(img, img_metas)
 
         # Standard single-window training (backward compatible)
         x = self.extract_feat(img)
@@ -111,22 +164,63 @@ class PAVE(DETR):
         # Track diagnostic keys — use last window's values (not averaged),
         # since only windows after the first have meaningful track queries.
         _track_diag_keys = {'trk_kpt_l1', 'det_kpt_l1', 'n_trk', 'n_trk_pos',
-                            'n_det_pos', 'trk_id_con'}
+                            'n_det_pos', 'trk_id_con', 'n_fn_drop', 'n_fp_inj',
+                            'n_hard_match', 'n_hard_bg', 'trk_cls_val', 'det_cls_val'}
+
+        # ---- TrackFormer-style per-query augmentation probabilities ----
+        # pFN: each track query is independently dropped with this probability.
+        #      Dropped queries' GT objects fall back to detect queries, forcing
+        #      detect queries to cover ~pFN of all tracked persons too.
+        # Configurable via bbox_head.track_p_fn (default 0.4 per TrackFormer).
+        _P_FN = getattr(self.bbox_head, 'track_p_fn', 0.4)
 
         T = len(imgs)
         for t in range(T):
+            is_last = (t == T - 1)
+
+            # ---- Per-query false-negative dropout (TrackFormer §3.3) ----
+            # Applied before the last window (which has track queries).
+            effective_track_state = track_state
+            n_fn_dropped = 0
+            if is_last and track_state is not None:
+                tq, tr, tp, tids = track_state
+                n_queries = tq.shape[1]  # [bs, N_trk, dim]
+                keep_mask = torch.tensor(
+                    [random.random() >= _P_FN for _ in range(n_queries)],
+                    dtype=torch.bool)
+                n_fn_dropped = int((~keep_mask).sum().item())
+                if keep_mask.any():
+                    effective_track_state = (
+                        tq[:, keep_mask, :],
+                        tr[:, keep_mask, :],
+                        tp[:, keep_mask, :],
+                        tids[keep_mask],
+                    )
+                else:
+                    # All queries dropped — equivalent to first-frame
+                    effective_track_state = None
+
+            # Compute loss on ALL windows with gradients (TrackFormer-style).
+            # Window 0 has no track queries → detect queries must cover all GT.
+            # Window 1+ has track queries → detect queries cover remaining GT.
+            # This prevents detect query specialization.
             x = self.extract_feat(imgs[t])
             losses, track_state = self.bbox_head.forward_train_sequential(
-                x, img_metas_list[t], gt_bboxes_list[t], gt_labels_list[t],
-                gt_keypoints_list[t], gt_areas_list[t],
+                x, img_metas_list[t], gt_bboxes_list[t],
+                gt_labels_list[t], gt_keypoints_list[t],
+                gt_areas_list[t],
                 gt_track_ids_list[t] if gt_track_ids_list is not None else None,
-                gt_bboxes_ignore, track_state=track_state)
+                gt_bboxes_ignore, track_state=effective_track_state)
+            if is_last:
+                # Inject FN dropout count into diagnostics
+                losses['n_fn_drop'] = torch.tensor(
+                    float(n_fn_dropped), device=imgs[t].device)
 
-            # Accumulate losses (averaged over T)
             for k, v in losses.items():
                 if k in _track_diag_keys:
-                    # Override with latest window's value (not averaged)
-                    total_losses[k] = v
+                    # Diagnostic keys: keep last window's values only
+                    if is_last:
+                        total_losses[k] = v
                 elif isinstance(v, torch.Tensor):
                     total_losses[k] = total_losses.get(k, 0) + v / T
                 elif isinstance(v, list):
@@ -135,7 +229,8 @@ class PAVE(DETR):
                     else:
                         total_losses[k] = [a + vi / T for a, vi in zip(total_losses[k], v)]
 
-            # DETACH track state to prevent gradient flow across windows
+            # Detach track state (prevents gradient flow across windows;
+            # also needed even for no_grad windows to drop any stale grad_fn)
             if track_state is not None:
                 track_state = tuple(
                     s.detach() if isinstance(s, torch.Tensor) else s
@@ -215,6 +310,24 @@ class PAVE(DETR):
         results_list = self.bbox_head.get_bboxes(
             *outs[:-1], img_metas, rescale=rescale)
 
+        # --- TrackFormer §3.3: Two-stage OKS-based NMS ---
+        # Stage 1: Track-vs-detect NMS — track queries take priority;
+        #          overlapping detect queries are suppressed.
+        # Stage 2: All-vs-all OKS NMS — removes strongly overlapping
+        #          duplicates that the decoder self-attention could not
+        #          resolve ("not resolvable by the decoder self-attention").
+        # Both stages use a HIGH threshold (default 0.9) to only suppress
+        # near-duplicates and preserve recall.
+        track_nms_thr = getattr(self.bbox_head, 'track_nms_thr', 0.9)
+        if n_track > 0 and track_nms_thr < 1.0:
+            results_list = [
+                self._nms_track_detect(item, n_track, track_nms_thr)
+                for item in results_list]
+        # All-vs-all OKS NMS with high threshold to remove remaining duplicates
+        results_list = [
+            self._oks_nms_all(item, oks_thr=track_nms_thr)
+            for item in results_list]
+
         # Update tracking state using the consistent ID array
         self._update_tracking_state(
             outs, results_list, n_track,
@@ -237,7 +350,7 @@ class PAVE(DETR):
         return bbox_kpt_results
 
     def _update_tracking_state(self, outs, results_list, n_track,
-                                score_thr=0.5, max_track_queries=100,
+                                score_thr=None, max_track_queries=None,
                                 all_query_track_ids=None):
         """Update tracking state after inference on a frame.
 
@@ -254,6 +367,12 @@ class PAVE(DETR):
                 for all queries. When provided, IDs are looked up from here
                 instead of being independently assigned.
         """
+        # Read thresholds from head config, with fallback defaults
+        if score_thr is None:
+            score_thr = getattr(self.bbox_head, 'track_score_thr', 0.5)
+        if max_track_queries is None:
+            max_track_queries = getattr(self.bbox_head, 'max_track_queries', 100)
+
         # Use stored hidden states from the head
         if not hasattr(self.bbox_head, '_last_hs') or self.bbox_head._last_hs is None:
             self.track_queries = None
@@ -307,6 +426,185 @@ class PAVE(DETR):
                     new_track_ids.append(self.next_track_id)
                     self.next_track_id += 1
         self.track_ids = new_track_ids
+
+    @staticmethod
+    def _get_oks_sigmas(det_kpts):
+        """Get per-keypoint sigmas based on the number of keypoints."""
+        num_kpts = det_kpts.shape[1]
+        if num_kpts == 15:
+            sigmas = det_kpts.new_tensor([
+                .26, .79, .79, .79, .79, .72, .72,
+                .62, .62, 1.07, 1.07, .87, .87, .89, .89]) / 10.0
+        elif num_kpts == 17:
+            sigmas = det_kpts.new_tensor([
+                .26, .25, .25, .35, .35, .79, .79, .72, .72,
+                .62, .62, 1.07, 1.07, .87, .87, .89, .89]) / 10.0
+        elif num_kpts == 14:
+            sigmas = det_kpts.new_tensor([
+                .79, .79, .72, .72, .62, .62, 1.07, 1.07,
+                .87, .87, .89, .89, .79, .79]) / 10.0
+        else:
+            sigmas = det_kpts.new_full((num_kpts,), 0.079)
+        return sigmas
+
+    @staticmethod
+    def _compute_pairwise_oks(kpts_a, bboxes_a, kpts_b, bboxes_b, sigmas):
+        """Compute pairwise OKS between two sets of keypoint detections.
+
+        Uses the average area of both poses as the OKS denominator (as in
+        COCO OKS evaluation), which is more stable than using only one side's
+        area — especially when keypoint-derived bounding boxes are small or
+        noisy.
+
+        Args:
+            kpts_a (Tensor): [A, K, 3] keypoints (x, y, score).
+            bboxes_a (Tensor): [A, 4+] bounding boxes.
+            kpts_b (Tensor): [B, K, 3] keypoints (x, y, score).
+            bboxes_b (Tensor): [B, 4+] bounding boxes.
+            sigmas (Tensor): [K] per-keypoint sigma values.
+
+        Returns:
+            Tensor: [A, B] pairwise OKS values.
+        """
+        variances = (sigmas * 2) ** 2  # [K]
+
+        areas_a = ((bboxes_a[:, 2] - bboxes_a[:, 0]) *
+                   (bboxes_a[:, 3] - bboxes_a[:, 1]))  # [A]
+        areas_b = ((bboxes_b[:, 2] - bboxes_b[:, 0]) *
+                   (bboxes_b[:, 3] - bboxes_b[:, 1]))  # [B]
+
+        # Use average area of both poses (COCO-style OKS denominator)
+        avg_areas = (areas_a[:, None] + areas_b[None, :]) / 2.0  # [A, B]
+
+        a_xy = kpts_a[:, :, :2]   # [A, K, 2]
+        b_xy = kpts_b[:, :, :2]   # [B, K, 2]
+        a_vis = kpts_a[:, :, 2]   # [A, K]
+        b_vis = kpts_b[:, :, 2]   # [B, K]
+
+        # Squared distances: [A, B, K]
+        diff = a_xy[:, None, :, :] - b_xy[None, :, :, :]  # [A, B, K, 2]
+        sq_dist = (diff ** 2).sum(-1)  # [A, B, K]
+
+        # Denominator: 2 * avg_area * var_k  → [A, B, K]
+        denom = 2.0 * avg_areas[:, :, None] * variances[None, None, :]
+        denom = denom.clamp(min=1e-6)
+
+        # Per-keypoint similarity
+        ks = torch.exp(-sq_dist / denom)  # [A, B, K]
+
+        # Visibility mask: both keypoints must be visible
+        vis_mask = (a_vis[:, None, :] > 0) & (b_vis[None, :, :] > 0)  # [A, B, K]
+
+        # OKS = mean over visible keypoints
+        n_vis = vis_mask.float().sum(-1).clamp(min=1.0)  # [A, B]
+        oks = (ks * vis_mask.float()).sum(-1) / n_vis     # [A, B]
+
+        return oks
+
+    @staticmethod
+    def _nms_track_detect(result_item, n_track, oks_thr=0.9):
+        """Remove detect query outputs that overlap with track query outputs.
+
+        TrackFormer (§3.3): after decoding, NMS is applied between track and
+        detect outputs.  Track queries take priority — any detect query whose
+        OKS with a track query exceeds ``oks_thr`` is suppressed.
+
+        Uses a HIGH threshold (default 0.9, as recommended by TrackFormer) to
+        only remove near-duplicate detections while preserving recall.
+
+        Uses OKS with the *average area* of both poses as denominator (COCO
+        convention), which is more stable than using only one side's area.
+
+        Args:
+            result_item (tuple): (det_bboxes, det_labels, det_kpts, bbox_index)
+                as returned by ``get_bboxes``.  det_kpts has shape [N, K, 3]
+                with (x, y, score) per keypoint.
+            n_track (int): Number of track queries (first n_track in the
+                original query ordering).
+            oks_thr (float): OKS threshold for suppression. Use high values
+                (e.g. 0.9) to only suppress true duplicates.
+
+        Returns:
+            tuple: Filtered (det_bboxes, det_labels, det_kpts, bbox_index).
+        """
+        det_bboxes, det_labels, det_kpts, bbox_index = result_item
+        if len(det_bboxes) == 0 or n_track == 0:
+            return result_item
+
+        # Identify which results came from track vs detect queries
+        is_track = bbox_index < n_track  # bool [N]
+        if not is_track.any() or is_track.all():
+            return result_item
+
+        sigmas = PAVE._get_oks_sigmas(det_kpts)
+
+        track_kpts = det_kpts[is_track]       # [M, K, 3]
+        track_bboxes = det_bboxes[is_track]   # [M, 5]
+        detect_inds = (~is_track).nonzero(as_tuple=True)[0]
+        detect_kpts = det_kpts[detect_inds]   # [D, K, 3]
+        detect_bboxes = det_bboxes[detect_inds]  # [D, 5]
+
+        keep = torch.ones(len(det_bboxes), dtype=torch.bool,
+                          device=det_bboxes.device)
+
+        if len(detect_kpts) > 0 and len(track_kpts) > 0:
+            # [D, M] pairwise OKS using average area
+            oks = PAVE._compute_pairwise_oks(
+                detect_kpts, detect_bboxes, track_kpts, track_bboxes, sigmas)
+
+            # Suppress detect queries whose max OKS with any track query > threshold
+            max_oks, _ = oks.max(dim=1)  # [D]
+            suppress = max_oks > oks_thr
+            keep[detect_inds[suppress]] = False
+
+        return (det_bboxes[keep], det_labels[keep],
+                det_kpts[keep], bbox_index[keep])
+
+    @staticmethod
+    def _oks_nms_all(result_item, oks_thr=0.9):
+        """Apply greedy OKS-NMS across ALL detections (track + detect).
+
+        TrackFormer paper (§3.3) applies NMS with a high IoU threshold
+        (sigma_NMS = 0.9) to remove strongly overlapping duplicate predictions
+        that the decoder self-attention could not resolve.
+
+        This is applied AFTER _nms_track_detect as an additional cleanup step.
+
+        Args:
+            result_item (tuple): (det_bboxes, det_labels, det_kpts, bbox_index).
+            oks_thr (float): OKS threshold for suppression.
+
+        Returns:
+            tuple: Filtered (det_bboxes, det_labels, det_kpts, bbox_index).
+        """
+        det_bboxes, det_labels, det_kpts, bbox_index = result_item
+        N = len(det_bboxes)
+        if N <= 1:
+            return result_item
+
+        sigmas = PAVE._get_oks_sigmas(det_kpts)
+
+        # Compute full NxN pairwise OKS
+        oks_matrix = PAVE._compute_pairwise_oks(
+            det_kpts, det_bboxes, det_kpts, det_bboxes, sigmas)  # [N, N]
+
+        # Greedy NMS: iterate in descending score order
+        scores = det_bboxes[:, 4]  # confidence scores
+        order = scores.argsort(descending=True)
+        keep_mask = torch.ones(N, dtype=torch.bool, device=det_bboxes.device)
+
+        for i in range(N):
+            idx = order[i].item()
+            if not keep_mask[idx]:
+                continue
+            # Suppress all lower-scoring detections with OKS > threshold
+            for j in range(i + 1, N):
+                jdx = order[j].item()
+                if keep_mask[jdx] and oks_matrix[idx, jdx] > oks_thr:
+                    keep_mask[jdx] = False
+
+        return (det_bboxes[keep_mask], det_labels[keep_mask],
+                det_kpts[keep_mask], bbox_index[keep_mask])
 
     def merge_aug_results(self, aug_bboxes, aug_kpts, aug_scores, img_metas):
         """Merge augmented detection bboxes and keypoints.

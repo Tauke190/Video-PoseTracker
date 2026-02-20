@@ -172,9 +172,6 @@ def printTable(vals, motHeader=False):
     # logger = logging.getLogger(__name__)
     # print()
     # logger.info(f"=> Result Table: \n" + colored(table, "magenta"))
-    print(header)
-    print(row)
-    # return header+"\n", row+"\n"
     return cum
 
 

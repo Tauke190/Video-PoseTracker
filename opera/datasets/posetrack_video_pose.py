@@ -20,6 +20,7 @@ from mmdet.datasets import CustomDataset
 import os
 import scipy.io as sio
 import json
+import torch
 
 # 更新时间   ---- 2024-8-02
 @DATASETS.register_module()
@@ -721,9 +722,10 @@ class PosetrackVideoPoseDataset(CustomDataset):
                  proposal_nums=(100, 300, 1000),
                  iou_thrs=None,
                  metric_items=None,
-                 save_dir='work_dirs/test',
+                 save_dir=None,
                  score_thr=0.3,
-                 joint_score_thr=0.1):
+                 joint_score_thr=0.1,
+                 subset_eval=False):
         """Evaluation in COCO protocol.
 
         Args:
@@ -757,10 +759,17 @@ class PosetrackVideoPoseDataset(CustomDataset):
                 second MOTA evaluation. Joints with score below this are
                 omitted, reducing FPs from unannotated/occluded joints.
                 Default: 0.1.
+            subset_eval (bool): If True, use only COCO evaluation for fast
+                subset validation. Skips full PoseTrack evaluation which
+                requires external GT files. Default: False.
 
         Returns:
             dict[str, float]: COCO style evaluation metric.
         """
+        # Use default save_dir if not specified
+        if save_dir is None:
+            save_dir = 'work_dirs/test'
+
         from ..core.posetrack_utils.poseval.py.evaluateAP import evaluateAP
         from ..core.posetrack_utils.poseval.py.evaluateTracking import \
             evaluateTracking
@@ -769,34 +778,195 @@ class PosetrackVideoPoseDataset(CustomDataset):
 
         # --- Step 1: Unfiltered results for COCO AP ---
         result_files, tmp_dir = self.format_results(results, jsonfile_prefix)
-        # do eval with api
-        coco_dt = self.coco.loadRes(result_files['keypoints'])
+        # Suppress pycocotools verbose output
+        with contextlib.redirect_stdout(io.StringIO()):
+            coco_dt = self.coco.loadRes(result_files['keypoints'])
         coco_eval = COCOeval(self.coco, coco_dt, 'keypoints')
         coco_eval.params.useSegm = None
-        coco_eval.params.maxDets = [30]
+        coco_eval.params.maxDets = [20]
         coco_eval.params.imgIds = list(coco_dt.imgToAnns.keys())
-        # PoseTrack 15-keypoint sigmas for OKS calculation
-        # Order: nose, head_bottom, head_top, l_shoulder, r_shoulder,
-        #        l_elbow, r_elbow, l_wrist, r_wrist, l_hip, r_hip,
-        #        l_knee, r_knee, l_ankle, r_ankle
         coco_eval.params.kpt_oks_sigmas = np.array([
-            0.026,  # nose
-            0.025,  # head_bottom
-            0.025,  # head_top
-            0.079,  # left_shoulder
-            0.079,  # right_shoulder
-            0.072,  # left_elbow
-            0.072,  # right_elbow
-            0.062,  # left_wrist
-            0.062,  # right_wrist
-            0.107,  # left_hip
-            0.107,  # right_hip
-            0.087,  # left_knee
-            0.087,  # right_knee
-            0.089,  # left_ankle
-            0.089,  # right_ankle
+            0.026, 0.025, 0.025, 0.079, 0.079, 0.072, 0.072,
+            0.062, 0.062, 0.107, 0.107, 0.087, 0.087, 0.089, 0.089,
         ])
-        coco_eval.evaluate()
+        with contextlib.redirect_stdout(io.StringIO()):
+            coco_eval.evaluate()
+
+        # --- Subset evaluation: per-joint AP + MOTA on filtered GT ---
+        if subset_eval:
+            # Build set of subset image names (with images/ prefix for GT)
+            subset_images = set()
+            for info in self.data_infos:
+                subset_images.add('images/' + info['file_name'])
+
+            annot_dir = 'DcPose_supp_files/posetrack17_annotation_dirs/jsons/val/'
+
+            # Build tracking IDs and filtered predictions
+            has_model_track_ids = (len(results) > 0 and len(results[0]) >= 3
+                                   and results[0][2] is not None)
+            if has_model_track_ids:
+                tracking_ids_filt = self._build_model_tracking_ids(
+                    results, score_thr=score_thr)
+            else:
+                filtered_prefix = osp.join(
+                    tempfile.mkdtemp(), 'results_filtered_subset')
+                filtered_files = self.results2json(
+                    results, filtered_prefix, score_thr=score_thr)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    coco_dt_filt = self.coco.loadRes(filtered_files['keypoints'])
+                results_by_video_filt = self._prepare_video_results(
+                    coco_dt_filt, results)
+                tracking_ids_filt = self._assign_tracking_ids(
+                    results_by_video_filt)
+
+            # Build filtered predictions (score-thresholded)
+            if has_model_track_ids:
+                filtered_prefix = osp.join(
+                    tempfile.mkdtemp(), 'results_filtered_subset')
+                filtered_files = self.results2json(
+                    results, filtered_prefix, score_thr=score_thr)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    coco_dt_filt = self.coco.loadRes(filtered_files['keypoints'])
+
+            # Also build UNfiltered predictions for AP evaluation
+            tracking_ids_all = (
+                self._build_model_tracking_ids(results, score_thr=0.0)
+                if has_model_track_ids
+                else self._assign_tracking_ids(
+                    self._prepare_video_results(coco_dt, results))
+            )
+            out_data_ap = self._build_posetrack_output(
+                results, coco_dt, tracking_ids_all)
+            out_data_track = self._build_posetrack_output(
+                results, coco_dt_filt, tracking_ids_filt)
+
+            # Create temp dirs for subset-filtered GT and predictions
+            subset_gt_dir = os.path.join(tempfile.mkdtemp(), 'subset_gt')
+            subset_pred_dir = os.path.join(tempfile.mkdtemp(), 'subset_pred')
+            subset_ap_dir = os.path.join(tempfile.mkdtemp(), 'subset_ap')
+            os.makedirs(subset_gt_dir)
+            os.makedirs(subset_pred_dir)
+            os.makedirs(subset_ap_dir)
+
+            # For each GT video, filter to only subset frames
+            for gt_fname in os.listdir(annot_dir):
+                if not gt_fname.endswith('.json'):
+                    continue
+                with open(os.path.join(annot_dir, gt_fname)) as f:
+                    gt_data = json.load(f)
+                if 'annolist' not in gt_data:
+                    continue
+                gt_frames = gt_data['annolist']
+
+                # Filter GT to subset frames only
+                filtered_gt = [
+                    fr for fr in gt_frames
+                    if fr['image'][0]['name'] in subset_images
+                ]
+                if len(filtered_gt) < 2:
+                    continue  # Need >= 2 frames for MOTA (last frame is dropped)
+
+                # Get video name key (without images/ prefix)
+                first_img = filtered_gt[0]['image'][0]['name']
+                vname_key = os.path.dirname(first_img)
+                if vname_key.startswith('images/'):
+                    vname_key = vname_key[len('images/'):]
+
+                # Build matching prediction frames for MOTA (filtered)
+                pred_frames = out_data_track.get(vname_key, [])
+                pred_by_name = {}
+                for pf in pred_frames:
+                    pred_by_name[pf['image']['name']] = pf
+
+                matched_preds = []
+                for gt_fr in filtered_gt:
+                    gt_img = gt_fr['image'][0]['name']
+                    pred_img = gt_img
+                    if pred_img.startswith('images/'):
+                        pred_img = pred_img[len('images/'):]
+                    if pred_img in pred_by_name:
+                        matched_preds.append(pred_by_name[pred_img])
+                    else:
+                        matched_preds.append({
+                            'image': {'name': pred_img},
+                            'imgnum': gt_fr.get('imgnum', [0]),
+                            'annorect': []
+                        })
+
+                # Build matching prediction frames for AP (unfiltered)
+                ap_frames = out_data_ap.get(vname_key, [])
+                ap_by_name = {}
+                for af in ap_frames:
+                    ap_by_name[af['image']['name']] = af
+
+                matched_ap = []
+                for gt_fr in filtered_gt:
+                    gt_img = gt_fr['image'][0]['name']
+                    pred_img = gt_img
+                    if pred_img.startswith('images/'):
+                        pred_img = pred_img[len('images/'):]
+                    if pred_img in ap_by_name:
+                        matched_ap.append(ap_by_name[pred_img])
+                    else:
+                        matched_ap.append({
+                            'image': {'name': pred_img},
+                            'imgnum': gt_fr.get('imgnum', [0]),
+                            'annorect': []
+                        })
+
+                assert len(matched_preds) == len(filtered_gt)
+                assert len(matched_ap) == len(filtered_gt)
+
+                write_json_to_file(
+                    {'annolist': filtered_gt},
+                    os.path.join(subset_gt_dir, gt_fname))
+                write_json_to_file(
+                    {'annolist': matched_preds},
+                    os.path.join(subset_pred_dir, gt_fname))
+                write_json_to_file(
+                    {'annolist': matched_ap},
+                    os.path.join(subset_ap_dir, gt_fname))
+
+            # Run per-joint AP evaluation on subset
+            print_log("=> Running AP evaluation (subset)")
+            gtFramesAP, prFramesAP = load_data_dir(
+                ['', subset_gt_dir, subset_ap_dir])
+            apAll, _, _ = evaluateAP(gtFramesAP, prFramesAP)
+            ap_cum = printTable(apAll)
+
+            # Run MOTA evaluation on subset-filtered data
+            print_log("=> Running tracking evaluation (subset)")
+            gtFramesAll, prFramesAll = load_data_dir(
+                ['', subset_gt_dir, subset_pred_dir])
+            metricsAll = evaluateTracking(gtFramesAll, prFramesAll, False)
+
+            nJoints = Joint().count
+            person_metrics = self.compute_person_level_mota(
+                gtFramesAll, prFramesAll, distThresh=0.5)
+
+            summary_str = (
+                f"=> Validation Summary (Subset): "
+                f"mAP={ap_cum[7]:.2f} | "
+                f"Person_MOTA={person_metrics['mota']:.2f}% | "
+                f"Precision={person_metrics['precision']:.2f}% | "
+                f"Recall={person_metrics['recall']:.2f}%"
+            )
+            print_log(summary_str)
+
+            name_value = OrderedDict([
+                ('Head', ap_cum[0]),
+                ('Shoulder', ap_cum[1]),
+                ('Elbow', ap_cum[2]),
+                ('Wrist', ap_cum[3]),
+                ('Hip', ap_cum[4]),
+                ('Knee', ap_cum[5]),
+                ('Ankle', ap_cum[6]),
+                ('Mean', ap_cum[7]),
+                ('Person_MOTA', person_metrics['mota']),
+                ('Person_Precision', person_metrics['precision']),
+                ('Person_Recall', person_metrics['recall']),
+            ])
+            return name_value, ap_cum[7]
 
         annot_dir = 'DcPose_supp_files/posetrack17_annotation_dirs/jsons/val/'
         # annot_dir = '/root/autodl-tmp/datasets/posetrack18/posetrack18_annotation_dirs/val/'
@@ -845,7 +1015,8 @@ class PosetrackVideoPoseDataset(CustomDataset):
             tempfile.mkdtemp(), 'results_filtered')
         filtered_files = self.results2json(
             results, filtered_prefix, score_thr=score_thr)
-        coco_dt_filtered = self.coco.loadRes(filtered_files['keypoints'])
+        with contextlib.redirect_stdout(io.StringIO()):
+            coco_dt_filtered = self.coco.loadRes(filtered_files['keypoints'])
 
         if has_model_track_ids:
             tracking_ids_filt = self._build_model_tracking_ids(
@@ -955,61 +1126,49 @@ class PosetrackVideoPoseDataset(CustomDataset):
             rec_filtered = None
             person_metrics_jf = None
 
-        # --- Print consolidated results ---
-        filt_col = f"{'Joint-Filtered':<20}" if joint_mota_filtered is not None else ""
-        filt_val = lambda v: f"{v:<20.2f}" if v is not None else ""
+        # --- Save detailed validation metrics to file ---
+        metrics_dict = {
+            'joint_mota_unfiltered': float(joint_mota_unfiltered),
+            'joint_mota_filtered': float(joint_mota_filtered) if joint_mota_filtered is not None else None,
+            'motp_unfiltered': float(motp_unfiltered),
+            'motp_filtered': float(motp_filtered) if motp_filtered is not None else None,
+            'pre_unfiltered': float(pre_unfiltered),
+            'pre_filtered': float(pre_filtered) if pre_filtered is not None else None,
+            'rec_unfiltered': float(rec_unfiltered),
+            'rec_filtered': float(rec_filtered) if rec_filtered is not None else None,
+            'person_metrics': person_metrics,
+            'person_metrics_jf': person_metrics_jf,
+            'ap_results': {
+                'Head': float(ap_cum[0]),
+                'Shoulder': float(ap_cum[1]),
+                'Elbow': float(ap_cum[2]),
+                'Wrist': float(ap_cum[3]),
+                'Hip': float(ap_cum[4]),
+                'Knee': float(ap_cum[5]),
+                'Ankle': float(ap_cum[6]),
+                'Mean': float(ap_cum[7])
+            }
+        }
 
-        lines = []
-        lines.append("\n" + "="*60)
-        lines.append("JOINT-LEVEL MEAN MOTA")
-        lines.append("="*60)
-        lines.append(f"{'Metric':<20} {'Unfiltered':<20} {filt_col}")
-        lines.append("-"*60)
-        lines.append(f"{'MOTA (%)':<20} {joint_mota_unfiltered:<20.2f} {filt_val(joint_mota_filtered)}")
-        lines.append(f"{'MOTP (%)':<20} {motp_unfiltered:<20.2f} {filt_val(motp_filtered)}")
-        lines.append(f"{'Precision (%)':<20} {pre_unfiltered:<20.2f} {filt_val(pre_filtered)}")
-        lines.append(f"{'Recall (%)':<20} {rec_unfiltered:<20.2f} {filt_val(rec_filtered)}")
-        lines.append("="*60)
+        # Save to metrics file
+        metrics_file = os.path.join(save_dir, 'validation_metrics.json')
+        os.makedirs(save_dir, exist_ok=True)
+        with open(metrics_file, 'w') as f:
+            json.dump(metrics_dict, f, indent=2)
+        print_log(f"=> Saved detailed validation metrics to {metrics_file}")
 
-        # Person-level MOTA comparison table
-        pf_col = f"{'Joint-Filtered':<20}" if person_metrics_jf else ""
-        pf_val = lambda k: f"{person_metrics_jf[k]:<20}" if person_metrics_jf else ""
-        pf_fval = lambda k: f"{person_metrics_jf[k]:<20.2f}" if person_metrics_jf else ""
+        # Print concise summary to training log and terminal
+        summary_str = (
+            f"=> Validation Summary: "
+            f"Person_MOTA={person_metrics['mota']:.2f}% | "
+            f"mAP={ap_cum[7]:.2f} | "
+            f"Joint_MOTA={joint_mota_unfiltered:.2f}% | "
+            f"Precision={pre_unfiltered:.2f}% | "
+            f"Recall={rec_unfiltered:.2f}%"
+        )
+        print_log(summary_str)
 
-        lines.append("")
-        lines.append("="*60)
-        lines.append("PERSON-LEVEL MOTA")
-        lines.append("="*60)
-        lines.append(f"{'Metric':<20} {'Unfiltered':<20} {pf_col}")
-        lines.append("-"*60)
-        lines.append(f"{'GT Persons':<20} {person_metrics['gt_persons']:<20} {pf_val('gt_persons')}")
-        lines.append(f"{'Matched':<20} {person_metrics['matched']:<20} {pf_val('matched')}")
-        lines.append(f"{'Misses':<20} {person_metrics['misses']:<20} {pf_val('misses')}")
-        lines.append(f"{'False Positives':<20} {person_metrics['fp']:<20} {pf_val('fp')}")
-        lines.append(f"{'ID Switches':<20} {person_metrics['id_switches']:<20} {pf_val('id_switches')}")
-        lines.append(f"{'MOTA (%)':<20} {person_metrics['mota']:<20.2f} {pf_fval('mota')}")
-        lines.append(f"{'Precision (%)':<20} {person_metrics['precision']:<20.2f} {pf_fval('precision')}")
-        lines.append(f"{'Recall (%)':<20} {person_metrics['recall']:<20.2f} {pf_fval('recall')}")
-        lines.append("="*60)
-
-        # AP results table
-        joint_ap_names = ['Head', 'Shoulder', 'Elbow', 'Wrist',
-                          'Hip', 'Knee', 'Ankle']
-        lines.append("")
-        lines.append("="*40)
-        lines.append("AVERAGE PRECISION (mAP)")
-        lines.append("="*40)
-        lines.append(f"{'Joint':<20} {'AP (%)':<20}")
-        lines.append("-"*40)
-        for i, name in enumerate(joint_ap_names):
-            lines.append(f"{name:<20} {ap_cum[i]:<20.2f}")
-        lines.append("-"*40)
-        lines.append(f"{'Mean':<20} {ap_cum[7]:<20.2f}")
-        lines.append("="*40 + "\n")
-
-        print_log("\n".join(lines))
-
-        name_value = [
+        name_value = OrderedDict([
             ('Head', ap_cum[0]),
             ('Shoulder', ap_cum[1]),
             ('Elbow', ap_cum[2]),
@@ -1017,10 +1176,13 @@ class PosetrackVideoPoseDataset(CustomDataset):
             ('Hip', ap_cum[4]),
             ('Knee', ap_cum[5]),
             ('Ankle', ap_cum[6]),
-            ('Mean', ap_cum[7])
-        ]
-
-        name_value = OrderedDict(name_value)
+            ('Mean', ap_cum[7]),
+            ('Person_MOTA', person_metrics['mota']),
+            ('Person_Precision', person_metrics['precision']),
+            ('Person_Recall', person_metrics['recall']),
+            ('Person_ID_Switches', person_metrics['id_switches']),
+            ('Joint_MOTA', float(joint_mota_unfiltered)),
+        ])
 
         return name_value, name_value['Mean']
 
@@ -1535,10 +1697,26 @@ class PosetrackSequentialDataset(PosetrackVideoPoseDataset):
         return len(self._seq_indices)
 
     def __getitem__(self, idx):
-        """Return a list of T processed samples from consecutive frames."""
+        """Return a list of T processed samples from consecutive frames.
+
+        All frames in the sequence share the same random augmentation seed
+        so that flip/scale are consistent across windows. Without this,
+        a flipped window 0 produces track queries at mirrored positions that
+        can never match GT in an unflipped window 1, causing the model to
+        learn to suppress all track query scores and degrading MOTA.
+        """
         seq = self._seq_indices[idx]
         samples = []
+        # Sample one seed for the whole sequence so all frames in the window
+        # get the same random flip / scale / crop decisions.
+        aug_seed = np.random.randint(0, 2**31)
         for frame_idx in seq:
+            # Reset numpy, Python, and PyTorch random state to the shared seed
+            # before each frame so the pipeline sees identical random draws.
+            np.random.seed(aug_seed)
+            import random as _random
+            _random.seed(aug_seed)
+            torch.manual_seed(aug_seed)
             # Use parent's prepare_train_img which applies the full pipeline
             sample = self.prepare_train_img(frame_idx)
             if sample is None:

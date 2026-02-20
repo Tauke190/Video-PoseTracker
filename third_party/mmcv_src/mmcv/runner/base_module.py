@@ -128,7 +128,8 @@ class BaseModule(nn.Module, metaclass=ABCMeta):
                           f'been called more than once.')
 
         if is_top_level_module:
-            self._dump_init_info(logger_name)
+            # Skip verbose per-parameter init dump (thousands of lines)
+            # self._dump_init_info(logger_name)
 
             for sub_module in self.modules():
                 del sub_module._params_init_info

@@ -33,7 +33,7 @@ train_pipeline = [
                 dict(
                     type='opera.MulResize',
                     # img_scale=[(400, 1400), (1400, 1400)],# Original
-                    img_scale=[(400, 1000), (1000, 1000)],
+                    img_scale=[(400, 800), (800, 800)],
                     multiscale_mode='range',
                     keep_ratio=True)
             ],
@@ -43,7 +43,7 @@ train_pipeline = [
                     # The radio of all image in train dataset < 7
                     # follow the original impl
                     #  img_scale=[(400, 4200), (500, 4200), (600, 4200)],#Original
-                    img_scale=[(400, 3000), (500, 3000), (600, 3000)], 
+                    img_scale=[(400, 800), (500, 3000), (600, 3000)], 
                     multiscale_mode='value',
                     keep_ratio=True),
                 dict(
@@ -54,7 +54,7 @@ train_pipeline = [
                 dict(
                     type='opera.MulResize',
                     # img_scale=[(400, 1400), (1400, 1400)], #Original:
-                    img_scale=[(400, 1000), (1000, 1000)],
+                    img_scale=[(400, 800), (800, 800)],
                     multiscale_mode='range',
                     override=True,
                     keep_ratio=True)
@@ -107,4 +107,4 @@ data = dict(
         ann_file=data_root + 'jsons/posetrack_val_15kpts.json',
         img_prefix=data_root + 'images/',
         pipeline=test_pipeline))
-evaluation = dict(interval=1, metric='keypoints', jsonfile_prefix='', score_thr=0.5)
+evaluation = dict(interval=1, metric='keypoints', jsonfile_prefix='', score_thr=0.5, save_dir=None)
