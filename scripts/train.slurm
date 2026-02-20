@@ -1,10 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=pavenet_track
 #SBATCH --output=ucf_output/slurm-%j.out
+#SBATCH --error=ucf_output/slurm-%j.err
 #SBATCH --gres-flags=enforce-binding
 #SBATCH -p gpu
 #SBATCH -C gmem48
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:2
 #SBATCH --mem-per-cpu=6G 
 #SBATCH --cpus-per-gpu=12
 
@@ -43,5 +44,4 @@ CONFIG=configs/PAVE/res50_num_frames_3_posetrack17_tracking.py
 GPUS=2
 PORT=${PORT:-29500}
 
-python -m torch.distributed.launch --nproc_per_node=$GPUS --master_port=$PORT \
-                         tools/train.py $CONFIG --launcher pytorch ${@:3}
+python -m torch.distributed.launch --nproc_per_node=$GPUS tools/train.py $CONFIG
