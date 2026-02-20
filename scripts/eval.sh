@@ -24,13 +24,13 @@ CUDA_DEVICE=2              # CUDA_VISIBLE_DEVICES value
 # CROWDPOSE=opera/datasets/crowd_pose.py
 
 POSETRACK_TRACKING=configs/PAVE/res50_num_frames_3_posetrack17_tracking.py
-WEIGHTs=work_dirs/res50_num_frames_3_posetrack17_tracking/epoch_10.pth
+WEIGHTs=work_dirs/res50_num_frames_3_posetrack17_tracking/epoch_13.pth
 # WORK_DIR=work_dirs/res50_num_frames_3_posetrack17
 # Weights/resnet50_posetrack.pth
 
 # Run evaluation on PoseTrack17 validation set
 # IMPORTANT: Use tracking config for trained tracking checkpoint to enable track-aware assignment
-EVAL_WORK_DIR=work_dirs/eval_results_pavenet_tracking_epoch1
+EVAL_WORK_DIR=work_dirs/eval_results_pavenet_tracking_epoch13
 
 CUDA_VISIBLE_DEVICES=$CUDA_DEVICE python tools/test.py \
     $POSETRACK_TRACKING \

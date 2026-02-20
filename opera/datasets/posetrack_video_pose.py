@@ -1128,16 +1128,7 @@ class PosetrackVideoPoseDataset(CustomDataset):
 
         # --- Save detailed validation metrics to file ---
         metrics_dict = {
-            'joint_mota_unfiltered': float(joint_mota_unfiltered),
-            'joint_mota_filtered': float(joint_mota_filtered) if joint_mota_filtered is not None else None,
-            'motp_unfiltered': float(motp_unfiltered),
-            'motp_filtered': float(motp_filtered) if motp_filtered is not None else None,
-            'pre_unfiltered': float(pre_unfiltered),
-            'pre_filtered': float(pre_filtered) if pre_filtered is not None else None,
-            'rec_unfiltered': float(rec_unfiltered),
-            'rec_filtered': float(rec_filtered) if rec_filtered is not None else None,
             'person_metrics': person_metrics,
-            'person_metrics_jf': person_metrics_jf,
             'ap_results': {
                 'Head': float(ap_cum[0]),
                 'Shoulder': float(ap_cum[1]),

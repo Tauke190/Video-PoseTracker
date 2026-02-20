@@ -218,4 +218,4 @@ if __name__ == '__main__':
         },
         ext_modules=[],
         cmdclass={'build_ext': BuildExtension},
-        zip_safe=False)
+        zip_safe=False)        python -c "import mmdet; print('MMDetection version:', mmdet.__version__)"

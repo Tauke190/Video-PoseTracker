@@ -44,4 +44,8 @@ CONFIG=configs/PAVE/res50_num_frames_3_posetrack17_tracking.py
 GPUS=2
 PORT=${PORT:-29500}
 
-python -m torch.distributed.launch --nproc_per_node=$GPUS tools/train.py $CONFIG
+# Override dataset path for HPC (different from local path)
+HPC_DATASET_PATH=/home/c3-0/datasets/posetrack/posetrack_2017
+
+python -m torch.distributed.launch --nproc_per_node=$GPUS tools/train.py $CONFIG \
+    --cfg-options data.train.data_root=$HPC_DATASET_PATH data.val.data_root=$HPC_DATASET_PATH
