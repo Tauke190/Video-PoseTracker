@@ -39,9 +39,9 @@ echo "========================================"
 
 cd home/av354855/projects/PAVENe
 
-CONFIG=configs/PAVE/res50_num_frames_3_posetrack17.py
+CONFIG=configs/PAVE/res50_num_frames_3_posetrack17_tracking.py
 GPUS=2
 PORT=${PORT:-29500}
 
-CUDA_VISIBLE_DEVICES=0,2 python -m torch.distributed.launch --nproc_per_node=$GPUS --master_port=$PORT \
+python -m torch.distributed.launch --nproc_per_node=$GPUS --master_port=$PORT \
                          tools/train.py $CONFIG --launcher pytorch ${@:3}
