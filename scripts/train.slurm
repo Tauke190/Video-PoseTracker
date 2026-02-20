@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=pavenet_train
+#SBATCH --job-name=pavenet_track
 #SBATCH --output=ucf_output/slurm-%j.out
 #SBATCH --gres-flags=enforce-binding
 #SBATCH -p gpu
@@ -22,7 +22,7 @@ module load cuda
 eval "$(conda shell.bash hook)"
 
 # Activate your conda environment
-conda activate sia
+conda activate pavenet
 echo "Job started at $(date)"
 echo "Running on node: $(hostname)"
 echo "GPU info:"
@@ -37,7 +37,7 @@ echo "========================================"
 cat $0
 echo "========================================"
 
-cd home/av354855/projects/PAVENe
+cd /home/av354855/Video-PoseTracker
 
 CONFIG=configs/PAVE/res50_num_frames_3_posetrack17_tracking.py
 GPUS=2
