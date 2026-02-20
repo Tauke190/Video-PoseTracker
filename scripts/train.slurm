@@ -38,7 +38,7 @@ echo "========================================"
 cat $0
 echo "========================================"
 
-cd /home/av354855/Video-PoseTracker
+cd /home/av354855/projects/PAVENet
 
 CONFIG=configs/PAVE/res50_num_frames_3_posetrack17_tracking.py
 GPUS=2
